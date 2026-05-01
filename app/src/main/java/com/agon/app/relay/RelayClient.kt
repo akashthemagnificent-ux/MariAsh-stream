@@ -56,6 +56,7 @@ class RelayClient(
         val role = if (isHost) "host" else "client"
         val encodedToken = if (relayToken.isNotBlank()) URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString()) else ""
         val tokenQuery = if (encodedToken.isNotBlank()) "&token=$encodedToken" else ""
+        val tokenQuery = if (relayToken.isNotBlank()) "&token=$relayToken" else ""
         val request = Request.Builder()
             .url("$wsUrl/sync/$roomId?role=$role$tokenQuery")
             .apply {
@@ -142,6 +143,11 @@ class RelayClient(
                     val body = response.body?.string().orEmpty()
                     Log.e("RelayClient", "Upload failed: ${response.code} for $filename $body")
                     throw IOException("Non-retryable upload error ${response.code} for $filename")
+                    if (response.code in 500..599) {
+                        throw IOException("Retryable upload error ${response.code} for $filename")
+                    }
+                    Log.e("RelayClient", "Upload failed: ${response.code} for $filename")
+                    return
                 }
             } catch (e: Exception) {
                 lastErr = e
