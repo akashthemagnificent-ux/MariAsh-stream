@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,9 +28,47 @@ import (
 // ─────────────────────────────────────────────────
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  65536,
 	WriteBufferSize: 65536,
+}
+
+var expectedRelayToken = os.Getenv("RELAY_TOKEN")
+var segmentNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+func authorize(r *http.Request) bool {
+	if expectedRelayToken == "" {
+		return true
+	}
+	provided := r.Header.Get("X-Relay-Token")
+	if provided == "" {
+		provided = r.URL.Query().Get("token")
+	}
+	return provided == expectedRelayToken
+}
+
+func validSegmentName(name string) bool {
+	if !segmentNamePattern.MatchString(name) {
+		return false
+	}
+	return strings.HasSuffix(name, ".ts") ||
+		strings.HasSuffix(name, ".m3u8") ||
+		strings.HasSuffix(name, ".vtt")
+}
+
+func setCommonHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Relay-Token")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+}
+
+func handlePreflight(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodOptions {
+		setCommonHeaders(w)
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
 }
 
 // A room holds the host and client connections and their HLS segments
@@ -35,12 +77,47 @@ type Room struct {
 	host     *websocket.Conn
 	client   *websocket.Conn
 	segments map[string][]byte // name → bytes
+	order    []string
+	bytes    int64
+	lastSeen time.Time
+}
+
+func (r *Room) segmentCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.segments)
 }
 
 func (r *Room) setSegment(name string, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if old, existed := r.segments[name]; existed {
+		r.bytes -= int64(len(old))
+	} else {
+		r.order = append(r.order, name)
+	}
 	r.segments[name] = data
+	r.bytes += int64(len(data))
+
+	// Evict by segment count first
+	for len(r.order) > maxSegmentsPerRoom {
+		old := r.order[0]
+		r.order = r.order[1:]
+		if oldData, ok := r.segments[old]; ok {
+			r.bytes -= int64(len(oldData))
+		}
+		delete(r.segments, old)
+	}
+
+	// Evict by total room bytes if configured
+	for maxRoomBytes > 0 && r.bytes > maxRoomBytes && len(r.order) > 0 {
+		old := r.order[0]
+		r.order = r.order[1:]
+		if oldData, ok := r.segments[old]; ok {
+			r.bytes -= int64(len(oldData))
+		}
+		delete(r.segments, old)
+	}
 }
 
 func (r *Room) getSegment(name string) ([]byte, bool) {
@@ -51,9 +128,83 @@ func (r *Room) getSegment(name string) ([]byte, bool) {
 }
 
 var (
-	rooms   = map[string]*Room{}
-	roomsMu sync.Mutex
+	rooms              = map[string]*Room{}
+	roomsMu            sync.Mutex
+	maxSegmentsPerRoom = envInt("MAX_SEGMENTS_PER_ROOM", 1800)
+	maxRoomBytes       = int64(envInt("MAX_ROOM_BYTES_MB", 1024)) * 1024 * 1024
+	uploadsPerMinute   = envInt("UPLOADS_PER_MINUTE", 600)
+	uploadLimiter      = newRateLimiter(time.Minute, uploadsPerMinute)
 )
+
+func envInt(key string, fallback int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil || n < 1 {
+		return fallback
+	}
+	return n
+}
+
+type rateLimiter struct {
+	mu      sync.Mutex
+	window  time.Duration
+	limit   int
+	buckets map[string][]time.Time
+}
+
+func newRateLimiter(window time.Duration, limit int) *rateLimiter {
+	return &rateLimiter{
+		window:  window,
+		limit:   limit,
+		buckets: map[string][]time.Time{},
+	}
+}
+
+func (r *rateLimiter) allow(key string) bool {
+	now := time.Now()
+	cutoff := now.Add(-r.window)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	entries := r.buckets[key]
+	pruned := entries[:0]
+	for _, ts := range entries {
+		if ts.After(cutoff) {
+			pruned = append(pruned, ts)
+		}
+	}
+	if len(pruned) >= r.limit {
+		r.buckets[key] = pruned
+		return false
+	}
+	pruned = append(pruned, now)
+	r.buckets[key] = pruned
+	return true
+}
+
+func (r *rateLimiter) pruneIdle() {
+	now := time.Now()
+	cutoff := now.Add(-r.window)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, entries := range r.buckets {
+		pruned := entries[:0]
+		for _, ts := range entries {
+			if ts.After(cutoff) {
+				pruned = append(pruned, ts)
+			}
+		}
+		if len(pruned) == 0 {
+			delete(r.buckets, key)
+		} else {
+			r.buckets[key] = pruned
+		}
+	}
+}
 
 func getOrCreateRoom(id string) *Room {
 	roomsMu.Lock()
@@ -62,14 +213,25 @@ func getOrCreateRoom(id string) *Room {
 		return r
 	}
 	r := &Room{segments: make(map[string][]byte)}
+	r.lastSeen = time.Now()
 	rooms[id] = r
 	return r
+}
+
+func (r *Room) touch() {
+	r.mu.Lock()
+	r.lastSeen = time.Now()
+	r.mu.Unlock()
 }
 
 // ─────────────────────────────────────────────────
 // WebSocket sync handler
 // ─────────────────────────────────────────────────
 func syncHandler(w http.ResponseWriter, r *http.Request) {
+	if !authorize(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	// Path: /sync/{roomId}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/sync/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
@@ -78,6 +240,19 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	roomId := parts[0]
 	role := r.URL.Query().Get("role")
+	if role != "host" && role != "client" {
+		http.Error(w, "invalid role", http.StatusBadRequest)
+		return
+	}
+
+	room := getOrCreateRoom(roomId)
+	room.mu.RLock()
+	roleOccupied := (role == "host" && room.host != nil) || (role == "client" && room.client != nil)
+	room.mu.RUnlock()
+	if roleOccupied {
+		http.Error(w, "role already connected", http.StatusConflict)
+		return
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -86,7 +261,7 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	room := getOrCreateRoom(roomId)
+	room.touch()
 	room.mu.Lock()
 	if role == "host" {
 		room.host = conn
@@ -135,6 +310,7 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[%s] relay write error: %v", roomId, err)
 			}
 		}
+		room.touch()
 	}
 
 	// Clean up connection reference
@@ -145,14 +321,31 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 		room.client = nil
 	}
 	room.mu.Unlock()
+	room.touch()
 }
 
 // ─────────────────────────────────────────────────
 // Segment upload handler (host PUT → relay stores in memory)
 // ─────────────────────────────────────────────────
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	setCommonHeaders(w)
+	if !authorize(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if r.Method != http.MethodPut {
 		http.Error(w, "PUT required", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		ip = host
+	}
+	if !uploadLimiter.allow(ip) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 	// Path: /upload/{roomId}/{filename}
@@ -164,6 +357,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	roomId := trimmed[:slashIdx]
 	filename := trimmed[slashIdx+1:]
+	if !validSegmentName(filename) {
+		http.Error(w, "invalid filename", http.StatusBadRequest)
+		return
+	}
 
 	data, err := io.ReadAll(io.LimitReader(r.Body, 50*1024*1024)) // 50 MB per segment max
 	if err != nil {
@@ -173,6 +370,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	room := getOrCreateRoom(roomId)
 	room.setSegment(filename, data)
+	room.touch()
 	log.Printf("[%s] stored %s (%d KB)", roomId, filename, len(data)/1024)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -181,6 +379,14 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 // Segment download handler (client GET)
 // ─────────────────────────────────────────────────
 func hlsHandler(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	setCommonHeaders(w)
+	if !authorize(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	// Path: /hls/{roomId}/{filename}
 	trimmed := strings.TrimPrefix(r.URL.Path, "/hls/")
 	slashIdx := strings.Index(trimmed, "/")
@@ -190,8 +396,13 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	roomId := trimmed[:slashIdx]
 	filename := trimmed[slashIdx+1:]
+	if !validSegmentName(filename) {
+		http.Error(w, "invalid filename", http.StatusBadRequest)
+		return
+	}
 
 	room := getOrCreateRoom(roomId)
+	room.touch()
 
 	// Retry for up to 30 seconds (playlist / segments may still be uploading)
 	var data []byte
@@ -222,8 +433,99 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(data)
+	room.touch()
+}
+
+func cleanupRoomsLoop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		uploadLimiter.pruneIdle()
+		now := time.Now()
+		roomsMu.Lock()
+		for id, room := range rooms {
+			room.mu.RLock()
+			idle := now.Sub(room.lastSeen)
+			hostNil := room.host == nil
+			clientNil := room.client == nil
+			room.mu.RUnlock()
+
+			// Evict rooms idle for >= 4 hours once both peers are disconnected
+			if hostNil && clientNil && idle >= 4*time.Hour {
+				delete(rooms, id)
+				log.Printf("[cleanup] evicted room=%s idle=%s", id, idle.String())
+			}
+		}
+		roomsMu.Unlock()
+	}
+}
+
+type relayStats struct {
+	Rooms            int `json:"rooms"`
+	ConnectedHosts   int `json:"connected_hosts"`
+	ConnectedClients int `json:"connected_clients"`
+	TotalSegments    int `json:"total_segments"`
+	TotalBytes       int64 `json:"total_bytes"`
+}
+
+type relayConfig struct {
+	MaxSegmentsPerRoom int   `json:"max_segments_per_room"`
+	MaxRoomBytes       int64 `json:"max_room_bytes"`
+	UploadsPerMinute   int   `json:"uploads_per_minute"`
+	RelayTokenEnabled  bool  `json:"relay_token_enabled"`
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	setCommonHeaders(w)
+	if !authorize(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	stats := relayStats{}
+	roomsMu.Lock()
+	stats.Rooms = len(rooms)
+	for _, room := range rooms {
+		room.mu.RLock()
+		if room.host != nil {
+			stats.ConnectedHosts++
+		}
+		if room.client != nil {
+			stats.ConnectedClients++
+		}
+		roomBytes := room.bytes
+		room.mu.RUnlock()
+		stats.TotalSegments += room.segmentCount()
+		stats.TotalBytes += roomBytes
+	}
+	roomsMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(stats)
+}
+
+func configHandler(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	setCommonHeaders(w)
+	if !authorize(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	cfg := relayConfig{
+		MaxSegmentsPerRoom: maxSegmentsPerRoom,
+		MaxRoomBytes:       maxRoomBytes,
+		UploadsPerMinute:   uploadsPerMinute,
+		RelayTokenEnabled:  expectedRelayToken != "",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(cfg)
 }
 
 func main() {
@@ -234,14 +536,23 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if handlePreflight(w, r) {
+			return
+		}
+		setCommonHeaders(w)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/sync/", syncHandler)
 	mux.HandleFunc("/upload/", uploadHandler)
 	mux.HandleFunc("/hls/", hlsHandler)
+	mux.HandleFunc("/stats", statsHandler)
+	mux.HandleFunc("/config", configHandler)
+	go cleanupRoomsLoop()
 
 	log.Printf("Agon relay server starting on :%s", port)
+	log.Printf("Relay config: token_enabled=%t max_segments_per_room=%d max_room_bytes=%d uploads_per_minute=%d",
+		expectedRelayToken != "", maxSegmentsPerRoom, maxRoomBytes, uploadsPerMinute)
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      mux,

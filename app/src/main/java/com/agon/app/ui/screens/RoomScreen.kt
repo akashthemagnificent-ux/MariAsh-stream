@@ -38,6 +38,7 @@ fun RoomScreen(
 ) {
     val context = LocalContext.current
     val relayUrl by AppPreferences.relayUrl(context).collectAsState(initial = "")
+    val relayToken by AppPreferences.relayToken(context).collectAsState(initial = "")
 
     val isConnected by viewModel.isConnected.collectAsState()
     val connectionStatus by viewModel.connectionStatus.collectAsState()
@@ -59,7 +60,7 @@ fun RoomScreen(
     }
 
     LaunchedEffect(roomId) {
-        viewModel.initRoom(roomId, isHost, relayUrl)
+        viewModel.initRoom(roomId, isHost, relayUrl, relayToken)
     }
 
     LaunchedEffect(webUrl) {
