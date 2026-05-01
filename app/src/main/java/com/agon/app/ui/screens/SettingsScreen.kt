@@ -81,6 +81,7 @@ fun SettingsScreen(navController: NavController) {
                     }
                     .build()
                 withContext(Dispatchers.IO) { client.newCall(request).execute() }.use { resp ->
+                client.newCall(request).execute().use { resp ->
                     checkResult = if (resp.isSuccessful) {
                         "Relay is reachable ✅"
                     } else {
@@ -117,6 +118,7 @@ fun SettingsScreen(navController: NavController) {
                     }
                     .build()
                 withContext(Dispatchers.IO) { client.newCall(request).execute() }.use { resp ->
+                client.newCall(request).execute().use { resp ->
                     relayConfigInfo = if (resp.isSuccessful) {
                         resp.body?.string()?.take(500) ?: "No config body"
                     } else {
@@ -209,6 +211,37 @@ fun SettingsScreen(navController: NavController) {
 
                     Button(onClick = { save() }, modifier = Modifier.fillMaxWidth()) {
                         Text(if (saved) "Saved!" else "Save Relay Settings")
+                    }
+
+                    OutlinedButton(
+                        onClick = { testRelay() },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking
+                    ) {
+                        Text(if (checking) "Testing..." else "Test Relay Connection")
+                    }
+                    OutlinedButton(
+                        onClick = { fetchRelayConfig() },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking
+                    ) {
+                        Text(if (checking) "Loading..." else "Fetch Relay Config")
+                    }
+
+                    checkResult?.let { msg ->
+                        Text(
+                            msg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (msg.contains("✅")) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error
+                        )
+                    }
+                    relayConfigInfo?.let { info ->
+                        Text(
+                            "Relay config: $info",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
 
                     OutlinedButton(

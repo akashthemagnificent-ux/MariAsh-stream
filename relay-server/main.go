@@ -288,6 +288,10 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 
 	room := getOrCreateRoom(roomId)
 	if !room.reserve(role) {
+	room.mu.RLock()
+	roleOccupied := (role == "host" && room.host != nil) || (role == "client" && room.client != nil)
+	room.mu.RUnlock()
+	if roleOccupied {
 		http.Error(w, "role already connected", http.StatusConflict)
 		return
 	}
@@ -302,6 +306,13 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 
 	room.touch()
 	room.commit(role, conn)
+	room.mu.Lock()
+	if role == "host" {
+		room.host = conn
+	} else {
+		room.client = conn
+	}
+	room.mu.Unlock()
 
 	log.Printf("[%s] %s connected", roomId, role)
 
