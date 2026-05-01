@@ -52,7 +52,7 @@ class RelayClient(
             .replace("http://", "ws://")
             .trimEnd('/')
         val role = if (isHost) "host" else "client"
-        val tokenQuery = if (relayToken.isNotBlank()) "&token=$relayToken" else ""
+        val tokenQuery = if (relayToken.isNotBlank()) "&token=${java.net.URLEncoder.encode(relayToken, "UTF-8")}" else ""
         val request = Request.Builder()
             .url("$wsUrl/sync/$roomId?role=$role$tokenQuery")
             .apply {
