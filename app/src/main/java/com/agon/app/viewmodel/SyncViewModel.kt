@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 data class SyncMessage(
     val type: String,
@@ -23,7 +25,8 @@ data class SyncMessage(
     val position: Long = 0L,
     val url: String? = null,
     val timestamp: Long = 0L,
-    val isPlaying: Boolean = false
+    val isPlaying: Boolean = false,
+    val streamEpoch: Long = 0L
 )
 
 class SyncViewModel(application: Application) : AndroidViewModel(application) {
@@ -33,6 +36,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private var relayClient: RelayClient? = null
     private var hlsSegmenter: HlsSegmenter? = null
+    private var relayToken: String = ""
 
     private val _isConnected = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _isConnected
@@ -57,6 +61,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isSegmenting = MutableStateFlow(false)
     val isSegmenting: StateFlow<Boolean> = _isSegmenting
+    private val _streamEpoch = MutableStateFlow(0L)
+    val streamEpoch: StateFlow<Long> = _streamEpoch
 
     // Fixed: partnerBuffering and latency were missing — VideoPlayer needs these
     private val _partnerBuffering = MutableStateFlow(false)
@@ -71,10 +77,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val _reactionCommand = MutableSharedFlow<String>(extraBufferCapacity = 32)
     val reactionCommand: SharedFlow<String> = _reactionCommand
 
-    fun initRoom(roomId: String, isHost: Boolean, relayUrl: String = "") {
+    fun initRoom(roomId: String, isHost: Boolean, relayUrl: String = "", relayToken: String = "") {
+        relayClient?.disconnect()
         _roomId.value = roomId
         _isHost.value = isHost
         _connectionStatus.value = "Connecting…"
+        this.relayToken = relayToken.trim()
 
         val baseUrl = if (relayUrl.isBlank()) "https://agon-relay.onrender.com"
                       else relayUrl.trimEnd('/')
@@ -83,13 +91,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             relayBaseUrl = baseUrl,
             roomId = roomId,
             isHost = isHost,
+            relayToken = this.relayToken,
             listener = object : RelayListener {
                 override fun onConnected() {
                     viewModelScope.launch {
                         _isConnected.value = true
                         _connectionStatus.value = "Connected"
                         if (!isHost) {
-                            _proxyUrl.value = "$baseUrl/hls/$roomId/playlist.m3u8"
+                            _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, _streamEpoch.value)
                         }
                     }
                 }
@@ -97,7 +106,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 override fun onDisconnected(reason: String) {
                     viewModelScope.launch {
                         _isConnected.value = false
-                        _connectionStatus.value = "Reconnecting…"
+                        _connectionStatus.value = if (
+                            reason.contains("401") || reason.contains("403") || reason.contains("Unauthorized", ignoreCase = true)
+                        ) "Authentication failed"
+                        else "Reconnecting…"
                     }
                 }
             }
@@ -109,15 +121,22 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         try {
             val msg = gson.fromJson(json, SyncMessage::class.java)
             when (msg.type) {
-                "state", "sync", "ping", "pong" -> viewModelScope.launch { _syncCommand.emit(msg) }
+                "state", "sync", "ping", "pong", "track" -> viewModelScope.launch { _syncCommand.emit(msg) }
                 "reaction" -> viewModelScope.launch { _reactionCommand.emit(msg.action) }
                 "buffering" -> viewModelScope.launch { _partnerBuffering.value = (msg.action == "start") }
                 "latency_update" -> viewModelScope.launch { _latency.value = msg.position }
                 "web_url" -> if (!_isHost.value) msg.url?.let { url ->
                     viewModelScope.launch { _videoUri.value = Uri.parse(url) }
                 }
+                "stream_reset" -> if (!_isHost.value) viewModelScope.launch {
+                    _streamEpoch.value = msg.streamEpoch
+                    _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, msg.streamEpoch)
+                    _videoUri.value = null
+                }
                 "stream_ready" -> if (!_isHost.value) viewModelScope.launch {
-                    _proxyUrl.value = "$baseUrl/hls/$roomId/playlist.m3u8"
+                    val epoch = if (msg.streamEpoch > 0) msg.streamEpoch else _streamEpoch.value
+                    _streamEpoch.value = epoch
+                    _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, epoch)
                 }
             }
         } catch (e: Exception) {
@@ -132,12 +151,22 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             )
         } catch (_: Exception) {}
         _videoUri.value = uri
-        if (_isHost.value) startSegmenting(uri)
+        if (_isHost.value) {
+            val epoch = System.currentTimeMillis()
+            _streamEpoch.value = epoch
+            sendMessage(gson.toJson(SyncMessage(type = "stream_reset", streamEpoch = epoch)))
+            startSegmenting(uri)
+        }
     }
 
     fun setWebUrl(url: String) {
         _videoUri.value = Uri.parse(url)
-        if (_isHost.value) sendMessage(gson.toJson(SyncMessage("web_url", url = url)))
+        if (_isHost.value) {
+            val epoch = System.currentTimeMillis()
+            _streamEpoch.value = epoch
+            sendMessage(gson.toJson(SyncMessage(type = "stream_reset", streamEpoch = epoch)))
+            sendMessage(gson.toJson(SyncMessage(type = "web_url", url = url, streamEpoch = epoch)))
+        }
     }
 
     private fun startSegmenting(uri: Uri) {
@@ -155,7 +184,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         relayClient?.uploadSegment(name, file.readBytes())
                         _segmentsUploaded.value++
                         if (_segmentsUploaded.value == 2) {
-                            sendMessage(gson.toJson(SyncMessage("stream_ready")))
+                            sendMessage(gson.toJson(SyncMessage(type = "stream_ready", streamEpoch = _streamEpoch.value)))
                         }
                     } catch (e: Exception) {
                         Log.e("SyncVM", "Segment upload failed: $name — ${e.message}")
@@ -164,7 +193,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             },
             onPlaylistReady = { content ->
                 viewModelScope.launch {
-                    try { relayClient?.uploadSegment("playlist.m3u8", content.toByteArray()) }
+                    try {
+                        val patched = patchPlaylistWithToken(content)
+                        relayClient?.uploadSegment("playlist.m3u8", patched.toByteArray())
+                    }
                     catch (e: Exception) { Log.e("SyncVM", "Playlist upload failed: ${e.message}") }
                 }
             },
@@ -176,6 +208,24 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendMessage(json: String) = relayClient?.sendSync(json)
+
+    private fun buildPlaylistUrl(baseUrl: String, roomId: String, epoch: Long): String {
+        val tokenPart = if (relayToken.isBlank()) "" else
+            "&token=${URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString())}"
+        return "${baseUrl.trimEnd('/')}/hls/$roomId/playlist.m3u8?v=$epoch$tokenPart"
+    }
+
+    private fun patchPlaylistWithToken(content: String): String {
+        if (relayToken.isBlank()) return content
+        val encoded = URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString())
+        return content.lineSequence().joinToString("\n") { line ->
+            if (line.startsWith("#") || line.isBlank()) return@joinToString line
+            if (line.contains("token=")) return@joinToString line
+            if (line.endsWith(".ts") || line.endsWith(".m3u8") || line.endsWith(".vtt")) {
+                if (line.contains("?")) "$line&token=$encoded" else "$line?token=$encoded"
+            } else line
+        }
+    }
 
     fun sendReaction(emoji: String) {
         sendMessage(gson.toJson(SyncMessage("reaction", action = emoji)))
