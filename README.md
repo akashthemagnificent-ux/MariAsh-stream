@@ -58,3 +58,20 @@ Open the Test Lab inside the app to simulate continent-level latency and packet 
 - HOST panel (green) plays the local file directly
 - CLIENT panel (blue) plays via the SimulatedRelay NanoHTTPD server with configurable delay/jitter/packet-loss/bandwidth throttle
 - Live stats: drift, one-way latency, upload KB/s, download KB/s, dropped packets
+
+## Automated APK builds (GitHub Actions)
+
+On every push, GitHub Actions now builds a debug APK automatically and publishes it in two places:
+- **Artifacts** for that workflow run (`MariAsh-Stream-debug-apk`)
+- A rolling **pre-release** tagged `latest-apk` containing the newest APK (renamed with version, e.g. `MariAsh-Stream-v1.0+1-debug.apk`)
+
+Workflow file: `.github/workflows/build-apk.yml`.
+
+### Versioning behavior on every push
+- GitHub Actions creates a **fresh APK build** on every push that matches that commit's source tree.
+- If code/resources are unchanged between two commits, the APK content can be effectively identical even though CI rebuilt it.
+- The workflow updates the same rolling release tag (`latest-apk`) and replaces the attached file there, so the public download link stays stable.
+- Each workflow run still keeps its own artifact copy (`MariAsh-Stream-debug-apk`) in Actions for run-by-run traceability.
+
+### Local relay build note
+If `go build` fails with a `proxy.golang.org ... Forbidden` error, it usually means the current environment blocks outbound module downloads. This is an environment/network restriction, not a source-code compile error in the relay.
