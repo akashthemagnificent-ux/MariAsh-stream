@@ -9,6 +9,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,11 +20,18 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.agon.app.data.AppPreferences
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -32,14 +41,93 @@ fun SettingsScreen(navController: NavController) {
     val keyboard = LocalSoftwareKeyboardController.current
 
     val storedUrl by AppPreferences.relayUrl(context).collectAsState(initial = "")
+    val storedToken by AppPreferences.relayToken(context).collectAsState(initial = "")
     var urlInput by remember(storedUrl) { mutableStateOf(storedUrl) }
+    var tokenInput by remember(storedToken) { mutableStateOf(storedToken) }
     var saved by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(false) }
+    var checkResult by remember { mutableStateOf<String?>(null) }
+    var relayConfigInfo by remember { mutableStateOf<String?>(null) }
+    var showToken by remember { mutableStateOf(false) }
 
     fun save() {
         keyboard?.hide()
         scope.launch {
             AppPreferences.setRelayUrl(context, urlInput.trim())
+            AppPreferences.setRelayToken(context, tokenInput.trim())
             saved = true
+        }
+    }
+
+    fun testRelay() {
+        val url = urlInput.trim().trimEnd('/')
+        if (url.isBlank()) {
+            checkResult = "Enter a relay URL first."
+            return
+        }
+        checking = true
+        checkResult = null
+        scope.launch {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .writeTimeout(8, TimeUnit.SECONDS)
+                .build()
+            try {
+                val request = Request.Builder()
+                    .url("$url/healthz")
+                    .apply {
+                        if (tokenInput.isNotBlank()) header("X-Relay-Token", tokenInput.trim())
+                    }
+                    .build()
+                withContext(Dispatchers.IO) { client.newCall(request).execute() }.use { resp ->
+                    checkResult = if (resp.isSuccessful) {
+                        "Relay is reachable ✅"
+                    } else {
+                        "Relay responded with HTTP ${resp.code}"
+                    }
+                }
+            } catch (e: Exception) {
+                checkResult = "Relay check failed: ${e.message}"
+            } finally {
+                checking = false
+            }
+        }
+    }
+
+    fun fetchRelayConfig() {
+        val url = urlInput.trim().trimEnd('/')
+        if (url.isBlank()) {
+            relayConfigInfo = "Enter a relay URL first."
+            return
+        }
+        checking = true
+        relayConfigInfo = null
+        scope.launch {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .writeTimeout(8, TimeUnit.SECONDS)
+                .build()
+            try {
+                val request = Request.Builder()
+                    .url("$url/config")
+                    .apply {
+                        if (tokenInput.isNotBlank()) header("X-Relay-Token", tokenInput.trim())
+                    }
+                    .build()
+                withContext(Dispatchers.IO) { client.newCall(request).execute() }.use { resp ->
+                    relayConfigInfo = if (resp.isSuccessful) {
+                        resp.body?.string()?.take(500) ?: "No config body"
+                    } else {
+                        "Config fetch failed: HTTP ${resp.code}"
+                    }
+                }
+            } catch (e: Exception) {
+                relayConfigInfo = "Config fetch failed: ${e.message}"
+            } finally {
+                checking = false
+            }
         }
     }
 
@@ -101,9 +189,57 @@ fun SettingsScreen(navController: NavController) {
                             }
                         }
                     )
+                    OutlinedTextField(
+                        value = tokenInput,
+                        onValueChange = { tokenInput = it; saved = false },
+                        label = { Text("Relay Token (optional)") },
+                        placeholder = { Text("shared-secret-token") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showToken = !showToken }) {
+                                Icon(
+                                    imageVector = if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showToken) "Hide token" else "Show token"
+                                )
+                            }
+                        }
+                    )
 
                     Button(onClick = { save() }, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (saved) "Saved!" else "Save Relay URL")
+                        Text(if (saved) "Saved!" else "Save Relay Settings")
+                    }
+
+                    OutlinedButton(
+                        onClick = { testRelay() },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking
+                    ) {
+                        Text(if (checking) "Testing..." else "Test Relay Connection")
+                    }
+                    OutlinedButton(
+                        onClick = { fetchRelayConfig() },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking
+                    ) {
+                        Text(if (checking) "Loading..." else "Fetch Relay Config")
+                    }
+
+                    checkResult?.let { msg ->
+                        Text(
+                            msg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (msg.contains("✅")) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error
+                        )
+                    }
+                    relayConfigInfo?.let { info ->
+                        Text(
+                            "Relay config: $info",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
