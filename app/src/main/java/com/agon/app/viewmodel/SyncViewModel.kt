@@ -78,6 +78,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     val reactionCommand: SharedFlow<String> = _reactionCommand
 
     fun initRoom(roomId: String, isHost: Boolean, relayUrl: String = "", relayToken: String = "") {
+        relayClient?.disconnect()
         _roomId.value = roomId
         _isHost.value = isHost
         _connectionStatus.value = "Connecting…"
@@ -90,6 +91,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             relayBaseUrl = baseUrl,
             roomId = roomId,
             isHost = isHost,
+            relayToken = this.relayToken,
             relayToken = relayToken,
             listener = object : RelayListener {
                 override fun onConnected() {
@@ -105,7 +107,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 override fun onDisconnected(reason: String) {
                     viewModelScope.launch {
                         _isConnected.value = false
-                        _connectionStatus.value = "Reconnecting…"
+                        _connectionStatus.value = if (
+                            reason.contains("401") || reason.contains("403") || reason.contains("Unauthorized", ignoreCase = true)
+                        ) "Authentication failed"
+                        else "Reconnecting…"
                     }
                 }
             }
@@ -117,7 +122,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         try {
             val msg = gson.fromJson(json, SyncMessage::class.java)
             when (msg.type) {
-                "state", "sync", "ping", "pong" -> viewModelScope.launch { _syncCommand.emit(msg) }
+                "state", "sync", "ping", "pong", "track" -> viewModelScope.launch { _syncCommand.emit(msg) }
                 "reaction" -> viewModelScope.launch { _reactionCommand.emit(msg.action) }
                 "buffering" -> viewModelScope.launch { _partnerBuffering.value = (msg.action == "start") }
                 "latency_update" -> viewModelScope.launch { _latency.value = msg.position }
@@ -131,6 +136,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 "stream_ready" -> if (!_isHost.value) viewModelScope.launch {
                     val epoch = if (msg.streamEpoch > 0) msg.streamEpoch else _streamEpoch.value
+                    _streamEpoch.value = epoch
                     _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, epoch)
                 }
             }
@@ -188,7 +194,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             },
             onPlaylistReady = { content ->
                 viewModelScope.launch {
-                    try { relayClient?.uploadSegment("playlist.m3u8", content.toByteArray()) }
+                    try {
+                        val patched = patchPlaylistWithToken(content)
+                        relayClient?.uploadSegment("playlist.m3u8", patched.toByteArray())
+                    }
                     catch (e: Exception) { Log.e("SyncVM", "Playlist upload failed: ${e.message}") }
                 }
             },
@@ -205,6 +214,18 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         val tokenPart = if (relayToken.isBlank()) "" else
             "&token=${URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString())}"
         return "${baseUrl.trimEnd('/')}/hls/$roomId/playlist.m3u8?v=$epoch$tokenPart"
+    }
+
+    private fun patchPlaylistWithToken(content: String): String {
+        if (relayToken.isBlank()) return content
+        val encoded = URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString())
+        return content.lineSequence().joinToString("\n") { line ->
+            if (line.startsWith("#") || line.isBlank()) return@joinToString line
+            if (line.contains("token=")) return@joinToString line
+            if (line.endsWith(".ts") || line.endsWith(".m3u8") || line.endsWith(".vtt")) {
+                if (line.contains("?")) "$line&token=$encoded" else "$line?token=$encoded"
+            } else line
+        }
     }
 
     fun sendReaction(emoji: String) {

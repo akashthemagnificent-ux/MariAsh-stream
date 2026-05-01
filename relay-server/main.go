@@ -80,6 +80,8 @@ type Room struct {
 	order    []string
 	bytes    int64
 	lastSeen time.Time
+	pendingHost   bool
+	pendingClient bool
 }
 
 func (r *Room) segmentCount() int {
@@ -224,6 +226,45 @@ func (r *Room) touch() {
 	r.mu.Unlock()
 }
 
+func (r *Room) reserve(role string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if role == "host" {
+		if r.host != nil || r.pendingHost {
+			return false
+		}
+		r.pendingHost = true
+		return true
+	}
+	if r.client != nil || r.pendingClient {
+		return false
+	}
+	r.pendingClient = true
+	return true
+}
+
+func (r *Room) commit(role string, conn *websocket.Conn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if role == "host" {
+		r.pendingHost = false
+		r.host = conn
+	} else {
+		r.pendingClient = false
+		r.client = conn
+	}
+}
+
+func (r *Room) releaseReservation(role string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if role == "host" {
+		r.pendingHost = false
+	} else {
+		r.pendingClient = false
+	}
+}
+
 // ─────────────────────────────────────────────────
 // WebSocket sync handler
 // ─────────────────────────────────────────────────
@@ -246,6 +287,7 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	room := getOrCreateRoom(roomId)
+	if !room.reserve(role) {
 	room.mu.RLock()
 	roleOccupied := (role == "host" && room.host != nil) || (role == "client" && room.client != nil)
 	room.mu.RUnlock()
@@ -256,12 +298,14 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		room.releaseReservation(role)
 		log.Printf("WebSocket upgrade error [%s/%s]: %v", roomId, role, err)
 		return
 	}
 	defer conn.Close()
 
 	room.touch()
+	room.commit(role, conn)
 	room.mu.Lock()
 	if role == "host" {
 		room.host = conn
@@ -362,9 +406,20 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := io.ReadAll(io.LimitReader(r.Body, 50*1024*1024)) // 50 MB per segment max
+	if cl := r.Header.Get("Content-Length"); cl != "" {
+		if n, err := strconv.ParseInt(cl, 10, 64); err == nil && n > 50*1024*1024 {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
+	limited := &io.LimitedReader{R: r.Body, N: 50*1024*1024 + 1}
+	data, err := io.ReadAll(limited)
 	if err != nil {
 		http.Error(w, "read error", http.StatusInternalServerError)
+		return
+	}
+	if int64(len(data)) > 50*1024*1024 {
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -426,6 +481,8 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 		contentType = "application/vnd.apple.mpegurl"
 	case strings.HasSuffix(filename, ".ts"):
 		contentType = "video/MP2T"
+	case strings.HasSuffix(filename, ".vtt"):
+		contentType = "text/vtt"
 	default:
 		contentType = "application/octet-stream"
 	}

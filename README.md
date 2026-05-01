@@ -75,3 +75,11 @@ Workflow file: `.github/workflows/build-apk.yml`.
 
 ### Local relay build note
 If `go build` fails with a `proxy.golang.org ... Forbidden` error, it usually means the current environment blocks outbound module downloads. This is an environment/network restriction, not a source-code compile error in the relay.
+
+### If no APK appears after merge
+Check these in order:
+1. **Actions enabled** for the repo/org and workflow runs are not blocked by policy.
+2. **Workflow run succeeded** (`Actions` tab → `Build Android APK`).
+3. **Repository Actions permissions** allow writing releases (`Settings → Actions → General → Workflow permissions: Read and write`).
+4. If artifact exists but no release APK, open the failed step in `Publish APK to "latest-apk" release` for error details.
+5. If no run started, confirm the workflow file exists on the default branch at `.github/workflows/build-apk.yml`.

@@ -14,6 +14,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.io.IOException
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import kotlin.math.min
 import kotlin.random.Random
 import java.util.concurrent.TimeUnit
@@ -52,6 +54,8 @@ class RelayClient(
             .replace("http://", "ws://")
             .trimEnd('/')
         val role = if (isHost) "host" else "client"
+        val encodedToken = if (relayToken.isNotBlank()) URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString()) else ""
+        val tokenQuery = if (encodedToken.isNotBlank()) "&token=$encodedToken" else ""
         val tokenQuery = if (relayToken.isNotBlank()) "&token=$relayToken" else ""
         val request = Request.Builder()
             .url("$wsUrl/sync/$roomId?role=$role$tokenQuery")
@@ -133,6 +137,12 @@ class RelayClient(
                         Log.d("RelayClient", "Uploaded $filename (${data.size} bytes)")
                         return
                     }
+                    if (response.code == 429 || response.code in 500..599) {
+                        throw IOException("Retryable upload error ${response.code} for $filename")
+                    }
+                    val body = response.body?.string().orEmpty()
+                    Log.e("RelayClient", "Upload failed: ${response.code} for $filename $body")
+                    throw IOException("Non-retryable upload error ${response.code} for $filename")
                     if (response.code in 500..599) {
                         throw IOException("Retryable upload error ${response.code} for $filename")
                     }

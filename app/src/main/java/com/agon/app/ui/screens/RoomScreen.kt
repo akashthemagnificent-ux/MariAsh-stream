@@ -59,6 +59,7 @@ fun RoomScreen(
         onDispose { activity?.removeOnPictureInPictureModeChangedListener(observer) }
     }
 
+    LaunchedEffect(roomId, relayUrl, relayToken) {
     LaunchedEffect(roomId) {
         viewModel.initRoom(roomId, isHost, relayUrl, relayToken)
     }
