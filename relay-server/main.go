@@ -288,6 +288,10 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 
 	room := getOrCreateRoom(roomId)
 	if !room.reserve(role) {
+	room.mu.RLock()
+	roleOccupied := (role == "host" && room.host != nil) || (role == "client" && room.client != nil)
+	room.mu.RUnlock()
+	if roleOccupied {
 		http.Error(w, "role already connected", http.StatusConflict)
 		return
 	}

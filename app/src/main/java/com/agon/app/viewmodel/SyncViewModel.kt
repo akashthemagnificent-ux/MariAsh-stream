@@ -92,6 +92,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             roomId = roomId,
             isHost = isHost,
             relayToken = this.relayToken,
+            relayToken = relayToken,
             listener = object : RelayListener {
                 override fun onConnected() {
                     viewModelScope.launch {
