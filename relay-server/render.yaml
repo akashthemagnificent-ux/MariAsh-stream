@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: agon-relay
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: singapore  # closest to India; change to ohio for USA test
+    plan: free
+    envVars:
+      - key: PORT
+        value: "8080"
+    healthCheckPath: /healthz
