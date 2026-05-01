@@ -62,6 +62,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
+    implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui-tooling-preview")
 
@@ -87,7 +88,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
 
     // FFmpegKit — remuxes local movie to HLS segments, zero re-encoding
-    implementation("com.arthenica:ffmpeg-kit-min-gpl:6.0-2")
+    implementation("com.arthenica:ffmpeg-kit-full:5.1")
 
     // OkHttp — WebSocket for sync messages + HTTP for segment uploads
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
