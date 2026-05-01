@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.C
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -62,6 +63,7 @@ fun VideoPlayer(
     var showTrackSelector by remember { mutableStateOf(false) }
     var availableTracks by remember { mutableStateOf<Tracks?>(null) }
     var wasPlayingBeforeBuffer by remember { mutableStateOf(false) }
+    var localLatencyMs by remember { mutableStateOf(0L) }
 
     val partnerIsBuffering by partnerBuffering.collectAsState()
     val currentLatency by latency.collectAsState()
@@ -187,6 +189,7 @@ fun VideoPlayer(
                         if (!isHost) {
                             val rtt = System.currentTimeMillis() - msg.timestamp
                             val oneWay = rtt / 2
+                            localLatencyMs = oneWay
                             // Correct for the transit time to estimate where host is RIGHT NOW
                             val estimatedHostPos = msg.position + if (msg.isPlaying) oneWay else 0L
                             val drift = abs(exoPlayer.currentPosition - estimatedHostPos)
@@ -211,6 +214,28 @@ fun VideoPlayer(
                                 "seek" -> exoPlayer.seekTo(msg.position)
                                 "position" -> if (abs(exoPlayer.currentPosition - msg.position) > 2000)
                                     exoPlayer.seekTo(msg.position)
+                            }
+                        }
+                    }
+                    "track" -> {
+                        if (!isHost) {
+                            val targetType = when (msg.action) {
+                                "audio" -> C.TRACK_TYPE_AUDIO
+                                "text" -> C.TRACK_TYPE_TEXT
+                                else -> -1
+                            }
+                            if (targetType != -1) {
+                                val targetIndex = msg.position.toInt().coerceAtLeast(0)
+                                val candidateGroup = availableTracks?.groups
+                                    ?.firstOrNull { it.type == targetType && targetIndex < it.length }
+                                if (candidateGroup != null) {
+                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                        .buildUpon()
+                                        .setOverrideForType(
+                                            TrackSelectionOverride(candidateGroup.mediaTrackGroup, targetIndex)
+                                        )
+                                        .build()
+                                }
                             }
                         }
                     }
@@ -253,10 +278,11 @@ fun VideoPlayer(
             }
 
             // Latency indicator (client only)
-            if (!isHost && currentLatency > 0L) {
+            val shownLatency = if (localLatencyMs > 0L) localLatencyMs else currentLatency
+            if (!isHost && shownLatency > 0L) {
                 Text(
-                    text = "Ping ${currentLatency}ms",
-                    color = if (currentLatency > 300L) Color.Yellow else Color.Green,
+                    text = "Ping ${shownLatency}ms",
+                    color = if (shownLatency > 300L) Color.Yellow else Color.Green,
                     fontSize = 11.sp,
                     modifier = Modifier
                         .align(Alignment.TopStart)
@@ -275,6 +301,16 @@ fun VideoPlayer(
                             .buildUpon()
                             .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, index))
                             .build()
+                        if (isHost) {
+                            val action = when (group.type) {
+                                C.TRACK_TYPE_AUDIO -> "audio"
+                                C.TRACK_TYPE_TEXT -> "text"
+                                else -> ""
+                            }
+                            if (action.isNotEmpty()) {
+                                onSendSync(gson.toJson(SyncMessage(type = "track", action = action, position = index.toLong())))
+                            }
+                        }
                         showTrackSelector = false
                     }
                 )

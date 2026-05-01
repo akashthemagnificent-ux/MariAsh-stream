@@ -87,7 +87,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
 
     // FFmpegKit — remuxes local movie to HLS segments, zero re-encoding
-    implementation("com.arthenica:ffmpeg-kit-min-gpl:6.0-2")
+    implementation("com.antonkarpenko:ffmpeg-kit-full-gpl:2.1.0")
 
     // OkHttp — WebSocket for sync messages + HTTP for segment uploads
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
