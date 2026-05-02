@@ -438,3 +438,136 @@ This rule applies for the lifetime of this project. Even if a future Android SDK
 
 9. **Never access `MediaMuxer.OutputFormat.*` constants directly.** `OutputFormat` is a source-retention annotation in Android SDK compileSdk ≥ 29. Its members are invisible to the Kotlin 2.0 K2 compiler. Always use the local `private const val MUXER_OUTPUT_MP4 = 0` defined in `HlsSegmenter.kt`'s companion object. Do not remove or rename that constant. See Bug 8 for full details.
   
+  ---
+
+  ## Bug 9 — Render Deploy Fails: "open Dockerfile: no such file or directory"
+
+  ### Files
+  - `render.yaml` (was missing at repo root; only existed in `relay-server/`)
+
+  ### Symptom
+  Render.com web service build fails immediately with:
+  ```
+  error: failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory
+  ```
+
+  ### Root Cause
+  Render looks for `render.yaml` at the **repository root**. The file was placed in
+  `relay-server/render.yaml` (a subdirectory), so Render ignored it entirely and tried
+  to build using the repository root as the Docker context — where there is no Dockerfile.
+
+  ### Fix Applied
+  Created a new `render.yaml` at the **repository root** containing the correct
+  `rootDir: relay-server` directive:
+
+  ```yaml
+  services:
+    - type: web
+      name: agon-relay
+      runtime: docker
+      rootDir: relay-server       # ← treats relay-server/ as the build root
+      dockerfilePath: ./Dockerfile # ← now resolves to relay-server/Dockerfile
+      region: singapore
+      plan: free
+      envVars:
+        - key: PORT
+          value: "8080"
+        - key: RELAY_TOKEN
+          generateValue: true
+      healthCheckPath: /healthz
+  ```
+
+  `rootDir: relay-server` makes Render:
+  1. Resolve `dockerfilePath` relative to `relay-server/`
+  2. Set the Docker build context to `relay-server/`
+
+  This is required because the Dockerfile COPY commands reference `go.mod`, `go.sum`,
+  and `main.go` without any subdirectory prefix — they must be at the root of the
+  Docker build context.
+
+  ### Prevention Rule
+  **`render.yaml` must always be at the repository root.** Never place it in a
+  subdirectory. If the deployable service lives in a subdirectory, use the
+  `rootDir: <subdirectory>` field inside the render.yaml (at root) to point Render
+  at the correct directory. Do not move render.yaml into the subdirectory.
+
+  ---
+
+  ## Bug 10 — Relay Server Rejects .mp4 Segment Uploads (400 Bad Request)
+
+  ### File
+  `relay-server/main.go` — `validSegmentName()` function
+
+  ### Symptom
+  The Android app uploads `.mp4` segments to the relay server. The server responds
+  with `400 Bad Request: invalid filename`. No segments are stored. The client cannot
+  play anything.
+
+  ### Root Cause
+  The `validSegmentName` whitelist was never updated when segments were renamed from
+  `.ts` to `.mp4` in Bug 7's fix. It still only allowed `.ts`, `.m3u8`, and `.vtt`:
+
+  ```go
+  // BEFORE (broken — rejects all .mp4 uploads)
+  return strings.HasSuffix(name, ".ts") ||
+      strings.HasSuffix(name, ".m3u8") ||
+      strings.HasSuffix(name, ".vtt")
+  ```
+
+  ### Fix Applied
+  Added `.mp4` as a valid suffix (kept `.ts` for backward compatibility):
+
+  ```go
+  // AFTER
+  return strings.HasSuffix(name, ".mp4") ||
+      strings.HasSuffix(name, ".m3u8") ||
+      strings.HasSuffix(name, ".vtt") ||
+      strings.HasSuffix(name, ".ts")
+  ```
+
+  ### Prevention Rule
+  **When changing the segment file extension anywhere in the Android app, also update
+  `validSegmentName` in `relay-server/main.go`.** The two must always agree on the
+  allowed segment extension. Search for all references to the old extension across the
+  entire repository before committing.
+
+  ---
+
+  ## Bug 11 — Relay Server Serves .mp4 Segments with Wrong MIME Type
+
+  ### File
+  `relay-server/main.go` — `hlsHandler()` function
+
+  ### Symptom
+  Even after Bug 10 is fixed and uploads succeed, ExoPlayer may refuse to play or
+  show a degraded experience because the relay serves `.mp4` segments as
+  `application/octet-stream` (binary blob) instead of `video/mp4`.
+
+  ### Root Cause
+  The content-type switch in `hlsHandler` had no case for `.mp4`:
+
+  ```go
+  // BEFORE — .mp4 falls through to the default
+  case strings.HasSuffix(filename, ".ts"):
+      contentType = "video/MP2T"
+  // no .mp4 case → falls through to:
+  default:
+      contentType = "application/octet-stream"
+  ```
+
+  ### Fix Applied
+  Added a `.mp4` case before `.ts`:
+
+  ```go
+  // AFTER
+  case strings.HasSuffix(filename, ".mp4"):
+      contentType = "video/mp4"
+  case strings.HasSuffix(filename, ".ts"):
+      contentType = "video/MP2T"
+  ```
+
+  ### Prevention Rule
+  **When adding a new segment format, update BOTH the `validSegmentName` whitelist AND
+  the content-type switch in `hlsHandler`.** Any segment extension accepted for upload
+  must also have a correct MIME type defined for download.
+  

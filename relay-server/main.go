@@ -51,9 +51,12 @@ func validSegmentName(name string) bool {
 	if !segmentNamePattern.MatchString(name) {
 		return false
 	}
-	return strings.HasSuffix(name, ".ts") ||
+	// Segments are MP4 (changed from .ts in Bug 7 fix).
+	// .m3u8 = HLS playlist, .vtt = subtitle track, .ts kept for compatibility.
+	return strings.HasSuffix(name, ".mp4") ||
 		strings.HasSuffix(name, ".m3u8") ||
-		strings.HasSuffix(name, ".vtt")
+		strings.HasSuffix(name, ".vtt") ||
+		strings.HasSuffix(name, ".ts")
 }
 
 func setCommonHeaders(w http.ResponseWriter) {
@@ -479,6 +482,8 @@ func hlsHandler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasSuffix(filename, ".m3u8"):
 		contentType = "application/vnd.apple.mpegurl"
+	case strings.HasSuffix(filename, ".mp4"):
+		contentType = "video/mp4"
 	case strings.HasSuffix(filename, ".ts"):
 		contentType = "video/MP2T"
 	case strings.HasSuffix(filename, ".vtt"):

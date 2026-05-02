@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: agon-relay
+    runtime: docker
+    # rootDir tells Render to treat relay-server/ as the build root.
+    # dockerfilePath is then resolved relative to that root,
+    # so ./Dockerfile → relay-server/Dockerfile.
+    # The Docker build context is also relay-server/, which is required
+    # because the Dockerfile COPY commands reference go.mod, go.sum, and
+    # main.go directly (not under a subdirectory prefix).
+    rootDir: relay-server
+    dockerfilePath: ./Dockerfile
+    region: singapore   # closest to India; change to ohio for USA-side testing
+    plan: free
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: RELAY_TOKEN
+        generateValue: true   # Render auto-generates a secret; copy it into the Android app
+    healthCheckPath: /healthz
