@@ -156,6 +156,72 @@ android:theme="@style/Theme.AgonApp"
 
 ---
 
+---
+
+## Bug 5 — Wrong FFmpegKit Maven Coordinates in `app/build.gradle.kts`
+
+### File
+`app/build.gradle.kts`
+
+### What was wrong
+```kotlin
+// BAD — wrong group ID, this is a JitPack fork with an incompatible class structure
+implementation("com.antonkarpenko:ffmpeg-kit-full-gpl:2.1.0")
+```
+
+The codebase imports from `com.arthenica.ffmpegkit.*` (the official FFmpegKit API by Taner Sener / arthenica):
+```kotlin
+import com.arthenica.ffmpegkit.FFmpegKitConfig   // AgonApplication.kt
+import com.arthenica.ffmpegkit.FFmpegKit          // HlsSegmenter.kt
+import com.arthenica.ffmpegkit.ReturnCode         // HlsSegmenter.kt
+```
+
+`com.antonkarpenko:ffmpeg-kit-full-gpl` is a third-party JitPack re-package that does NOT expose the `com.arthenica.ffmpegkit` package. The Kotlin compiler cannot resolve any of these import references, resulting in:
+```
+e: .../AgonApplication.kt:4:12 Unresolved reference 'arthenica'.
+e: .../AgonApplication.kt:10:9 Unresolved reference 'FFmpegKitConfig'.
+e: .../HlsSegmenter.kt:6:12 Unresolved reference 'arthenica'.
+e: .../HlsSegmenter.kt:63:23 Unresolved reference 'FFmpegKit'.
+e: .../HlsSegmenter.kt:67:17 Unresolved reference 'ReturnCode'.
+```
+
+### Fix Applied
+Changed the dependency to the official arthenica release on Maven Central:
+```kotlin
+// CORRECT — official arthenica build on Maven Central, provides com.arthenica.ffmpegkit.*
+implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2")
+```
+
+No repository changes were needed — `mavenCentral()` is already declared in `settings.gradle.kts`.
+
+### API compatibility (6.0-2)
+All methods used in the codebase exist in 6.0-2:
+| Code call | Kotlin property / method | Exists in 6.0-2 |
+|-----------|--------------------------|-----------------|
+| `FFmpegKit.executeAsync(cmd) { session -> }` | static method | ✓ |
+| `FFmpegKit.cancel(sessionId)` | static method, takes `Long` | ✓ |
+| `FFmpegKitConfig.getSafParameterForRead(ctx, uri)` | static method | ✓ |
+| `FFmpegKitConfig.setLogLevel(level)` | static method | ✓ |
+| `session.returnCode` | `getReturnCode()` | ✓ |
+| `session.allLogsAsString` | `getAllLogsAsString()` | ✓ |
+| `session.sessionId` | `getSessionId()` | ✓ |
+| `ReturnCode.isSuccess(rc)` | static method | ✓ |
+
+### Prevention Rule
+**Always match the Maven `groupId:artifactId` to the package namespace used in imports.** Before adding a dependency, confirm:
+1. The group ID matches the top-level package the code imports from (e.g., `com.arthenica.*` → group `com.arthenica`).
+2. The artifact version actually exists on the declared repositories (verify on https://search.maven.org or https://mvnrepository.com).
+3. Do not substitute a JitPack fork (`com.github.*` or other group) unless the fork explicitly guarantees the same package namespace.
+
+The canonical FFmpegKit dependency for code that uses `com.arthenica.ffmpegkit.*` is always:
+```kotlin
+implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2")   // full GPL build (for remuxing)
+// OR
+implementation("com.arthenica:ffmpeg-kit-min:6.0-2")         // minimal build (no GPL codecs)
+```
+
+---
+
 ## Summary Table
 
 | # | File | Category | Error Type | Fix |
@@ -164,6 +230,7 @@ android:theme="@style/Theme.AgonApp"
 | 2 | `RelayClient.kt` | Dead code after `throw` | Unreachable code / stale patch | Removed code lines after the unconditional `throw` |
 | 3 | `RoomScreen.kt` | Composable in coroutine + unbalanced braces | Compose plugin error + Kotlin syntax error | Removed the wrapping outer `LaunchedEffect`, fixed keys |
 | 4 | `styles.xml` + `AndroidManifest.xml` | Circular style inheritance | AAPT resource link failure | Removed broken style, pointed manifest to `Theme.AgonApp` |
+| 5 | `app/build.gradle.kts` | Wrong Maven dependency coordinates | Kotlin compile error (unresolved references) | Changed to `com.arthenica:ffmpeg-kit-full-gpl:6.0-2` |
 
 ---
 
@@ -179,4 +246,6 @@ android:theme="@style/Theme.AgonApp"
 
 5. **After any Kotlin/XML edit, verify brace/tag balance.** An unclosed `{` in Kotlin or an unclosed tag in XML will always fail the build with a cryptic parser error. Count your opens and closes.
 
-6. **Incremental patching accumulates bugs.** Each time a file is patched by an agent, confirm that the new lines do not duplicate or conflict with existing lines in the same function. Read the surrounding 20-30 lines before making a change.
+6. **Match Maven group ID to the import package namespace.** The `groupId` in a Gradle dependency must correspond to the top-level Java package the code imports. Verify the artifact exists before using it.
+
+7. **Incremental patching accumulates bugs.** Each time a file is patched by an agent, confirm that the new lines do not duplicate or conflict with existing lines in the same function. Read the surrounding 20-30 lines before making a change.
