@@ -221,7 +221,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         return content.lineSequence().joinToString("\n") { line ->
             if (line.startsWith("#") || line.isBlank()) return@joinToString line
             if (line.contains("token=")) return@joinToString line
-            if (line.endsWith(".ts") || line.endsWith(".m3u8") || line.endsWith(".vtt")) {
+            if (line.endsWith(".mp4") || line.endsWith(".m3u8") || line.endsWith(".vtt")) {
                 if (line.contains("?")) "$line&token=$encoded" else "$line?token=$encoded"
             } else line
         }

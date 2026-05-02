@@ -118,7 +118,7 @@ class RelayClient(
         val contentType = if (filename.endsWith(".m3u8"))
             "application/vnd.apple.mpegurl".toMediaType()
         else
-            "video/MP2T".toMediaType()
+            "video/mp4".toMediaType()
 
         val request = Request.Builder()
             .url("${relayBaseUrl.trimEnd('/')}/upload/$roomId/$filename")

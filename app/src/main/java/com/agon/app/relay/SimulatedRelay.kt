@@ -92,7 +92,7 @@ class SimulatedRelay(private val port: Int = 9191) {
         override fun serve(session: IHTTPSession): Response {
             return when {
                 session.uri == "/hls/playlist.m3u8" -> servePlaylist()
-                session.uri.startsWith("/hls/") && session.uri.endsWith(".ts") -> {
+                session.uri.startsWith("/hls/") && session.uri.endsWith(".mp4") -> {
                     val name = session.uri.removePrefix("/hls/")
                     serveSegment(name)
                 }
@@ -129,7 +129,7 @@ class SimulatedRelay(private val port: Int = 9191) {
 
             return newFixedLengthResponse(
                 Response.Status.OK,
-                "video/MP2T",
+                "video/mp4",
                 ByteArrayInputStream(data),
                 data.size.toLong()
             ).also {
@@ -170,7 +170,7 @@ class SimulatedRelay(private val port: Int = 9191) {
     fun addSegment(name: String, data: ByteArray) {
         segments[name] = data
         _uploadedBytes.value += data.size
-        _segmentCount.value = segments.filter { it.key.endsWith(".ts") }.size
+        _segmentCount.value = segments.filter { it.key.endsWith(".mp4") }.size
         Log.d("SimulatedRelay", "Segment stored: $name (${data.size / 1024}KB), total: ${_segmentCount.value}")
     }
 

@@ -301,3 +301,60 @@ No external dependencies required — `MediaExtractor`, `MediaMuxer`, and `Media
 7. **`com.arthenica:ffmpeg-kit-*` and `com.antonkarpenko:ffmpeg-kit-*` are permanently unavailable.** Do not use them. Use Android's `MediaExtractor`+`MediaMuxer` for video segmentation (already implemented in `HlsSegmenter.kt`).
 
 8. **Incremental patching accumulates bugs.** Each time a file is patched by an agent, confirm that the new lines do not duplicate or conflict with existing lines in the same function. Read the surrounding 20-30 lines before making a change.
+  ---
+
+  ## Bug 7 — `Unresolved reference 'MUXER_OUTPUT_MPEG_TS'` (HlsSegmenter.kt:120)
+
+  ### Symptom
+  ```
+  e: HlsSegmenter.kt:120:75 Unresolved reference 'MUXER_OUTPUT_MPEG_TS'.
+  FAILURE: Build failed with an exception.
+  Execution failed for task ':app:compileDebugKotlin'.
+  ```
+
+  ### Root Cause
+  `MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS` **does not exist** in the public
+  Android SDK. The `MediaMuxer.OutputFormat` interface only defines:
+
+  | Constant | Value | Since API |
+  |---|---|---|
+  | `MUXER_OUTPUT_MP4` | 0 | 18 |
+  | `MUXER_OUTPUT_WEBM` | 1 | 21 |
+  | `MUXER_OUTPUT_3GPP` | 2 | 22 |
+  | `MUXER_OUTPUT_HEIF` | 3 | 28 |
+  | `MUXER_OUTPUT_OGG` | 4 | 29 |
+
+  There is no `MUXER_OUTPUT_MPEG_TS` in any public Android SDK release. The constant
+  was added to HlsSegmenter.kt in Bug 6's fix (which removed FFmpegKit and replaced it
+  with native Android MediaExtractor + MediaMuxer) but referenced a non-existent symbol.
+
+  ### Fix Applied
+  - **HlsSegmenter.kt line 120:** `MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS`
+    → `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4`
+  - **HlsSegmenter.kt line 117:** segment filename `seg_%05d.ts`
+    → `seg_%05d.mp4`
+
+  ExoPlayer's `media3-exoplayer-hls` fully supports HLS playlists whose segments
+  are individual MP4 files (each finalized `MediaMuxer` output is a valid, self-contained
+  MP4). No playlist version change is required for VOD MP4-segment HLS.
+
+  ### Follow-up Runtime Fixes (same commit)
+  Three additional files carried stale `.ts` / `video/MP2T` references that would
+  have broken the app at runtime (not at compile time):
+
+  | File | Change |
+  |---|---|
+  | `SimulatedRelay.kt` | Route `.mp4` segments instead of `.ts`; count `.mp4` files; serve with `video/mp4` MIME |
+  | `RelayClient.kt` | Upload segments with `video/mp4` instead of `video/MP2T` |
+  | `SyncViewModel.kt` | Token-patch playlist lines ending in `.mp4` instead of `.ts` |
+
+  ### Prevention Rules
+  1. **Never reference Android SDK constants by guessing** — verify every constant in
+     the [official MediaMuxer.OutputFormat docs](https://developer.android.com/reference/android/media/MediaMuxer.OutputFormat)
+     before use.
+  2. When replacing a library, audit **every file** in the project for extension strings
+     (`.ts`, `.m3u8`) and MIME types (`video/MP2T`) that the old library dictated —
+     they must all be updated together.
+  3. Prefer `MUXER_OUTPUT_MP4` (API 18+) for HLS segments; avoid MPEG-TS with
+     MediaMuxer entirely since the standard Android SDK does not support it.
+  
