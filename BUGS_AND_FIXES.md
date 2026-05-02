@@ -351,3 +351,56 @@ Host picks video
   (handles race between room creation and first upload).
 - Segment `GET` responses also wait up to 30 s if the segment hasn't arrived yet
   (handles network latency between host upload and client fetch).
+
+---
+
+## Session 3 — Local Test Lab Black Screen (Bugs 24–25)
+
+### Bug 24 🔴 — Client black screen: buffering-before-play deadlock
+**File:** `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`  
+**Symptom:** In the local test lab, the CLIENT panel shows a permanent black
+screen. The HOST shows "Partner is buffering… paused" and never resumes.
+The Ping and Drift stats appear (sync is working) but video never starts.  
+**Root cause:** The client VideoPlayer starts with `playWhenReady = false`
+(correct — it waits for the host's play command). As soon as ExoPlayer is
+prepared it enters `STATE_BUFFERING`, which triggered `onPlaybackStateChanged`
+to immediately send a `"buffering start"` sync message to the host.
+
+The host receives this, pauses itself, and sets `wasPlayingBeforeBuffer = true`.
+From that point the host pong always reports `isPlaying = exoPlayer.isPlaying`
+which is `false` (paused). The client's pong handler only calls `exoPlayer.play()`
+when `msg.isPlaying = true`, so the client never starts playing. ExoPlayer stays
+in `STATE_BUFFERING` because `playWhenReady = false` means it never advances.
+ExoPlayer never reaches `STATE_READY`, so `"buffering stop"` is never sent.
+The host never resumes. Perfect deadlock.
+
+**Fix:** Added `hasEverStartedPlaying` flag (initialized to `true` for host,
+`false` for client). The `onPlaybackStateChanged` callback now returns early
+if `!hasEverStartedPlaying`. This prevents the initial startup buffering from
+being reported to the host at all. The flag is set to `true` in the pong handler
+when `msg.isPlaying && !exoPlayer.isPlaying` (first play command), and also
+when a `"state play"` message is received. From that point on, mid-playback
+rebuffer stalls are reported normally.
+
+---
+
+### Bug 25 🟠 — Host pong reports wrong isPlaying when paused for partner buffering
+**File:** `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`  
+**Symptom:** If the client somehow sent `"buffering start"` before it had started
+playing (see Bug 24), the host paused and then reported `isPlaying = false` in
+every subsequent pong. Even after Bug 24 is fixed, this is a safety-net issue:
+if the host is paused *solely* because `partnerIsBuffering = true`, it should
+still tell the client "I intend to be playing" so the client knows to start
+playing when it's ready.  
+**Root cause:** Pong was built with `isPlaying = exoPlayer.isPlaying`. When the
+host is paused for partner buffering, `exoPlayer.isPlaying = false`, so the
+client receives `isPlaying = false` and stays paused forever.  
+**Fix:** Changed pong to report the *intended* play state:
+```
+val intendedPlaying = exoPlayer.isPlaying || (partnerIsBuffering && wasPlayingBeforeBuffer)
+```
+If the host is paused only because the partner is buffering (and was playing
+before the buffer pause), it still reports `isPlaying = true` in the pong.
+The client can then start playing as soon as its buffer is ready, and will send
+`"buffering stop"` when it reaches `STATE_READY`, which triggers the host to
+resume in the normal way.

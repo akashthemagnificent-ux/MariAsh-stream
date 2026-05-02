@@ -65,6 +65,22 @@ fun VideoPlayer(
     var wasPlayingBeforeBuffer by remember { mutableStateOf(false) }
     var localLatencyMs by remember { mutableStateOf(0L) }
 
+    // Bug fix (buffering deadlock): client must NOT send "buffering start/stop"
+    // until it has received at least one play command from the host.
+    //
+    // Without this guard, the sequence is:
+    //   1. Client ExoPlayer enters STATE_BUFFERING immediately on prepare()
+    //   2. Client sends "buffering start" — host pauses, wasPlayingBeforeBuffer=true
+    //   3. Host pong: isPlaying=false (host is paused) — client stays paused
+    //   4. Client stuck in STATE_BUFFERING because playWhenReady=false
+    //   5. Client never exits buffering → host never resumes → permanent deadlock
+    //
+    // By gating on hasEverStartedPlaying, we break the deadlock: the host keeps
+    // playing and sends pongs with isPlaying=true, which triggers exoPlayer.play()
+    // on the client. Only AFTER that first play() does the client start reporting
+    // buffering events (for rebuffer stalls mid-playback).
+    var hasEverStartedPlaying by remember { mutableStateOf(isHost) }
+
     val partnerIsBuffering by partnerBuffering.collectAsState()
     val currentLatency by latency.collectAsState()
 
@@ -100,7 +116,7 @@ fun VideoPlayer(
             exoPlayer.setMediaItem(MediaItem.fromUri(uri))
             exoPlayer.prepare()
             // Host plays immediately; client starts PAUSED and waits for the first
-            // sync "state play" from the host so it begins at the right position.
+            // sync "pong" with isPlaying=true from the host.
             // Bug 17 fix: client with playWhenReady=true starts at position 0 while
             // the host is already seconds ahead; desync on first load.
             exoPlayer.playWhenReady = isHost
@@ -149,6 +165,11 @@ fun VideoPlayer(
 
                 override fun onPlaybackStateChanged(state: Int) {
                     if (!isHost) {
+                        // Only report buffering events after the client has been told to play
+                        // at least once. Before the first play command, STATE_BUFFERING is
+                        // just normal ExoPlayer startup — not a real mid-playback stall.
+                        // Reporting it early causes the deadlock described above.
+                        if (!hasEverStartedPlaying) return
                         val action = when (state) {
                             Player.STATE_BUFFERING -> "start"
                             Player.STATE_READY -> "stop"
@@ -198,8 +219,22 @@ fun VideoPlayer(
                     when (msg.type) {
                         "ping" -> {
                             if (isHost) {
-                                val pong = SyncMessage("pong", position = exoPlayer.currentPosition,
-                                    timestamp = msg.timestamp, isPlaying = exoPlayer.isPlaying)
+                                // Bug fix (host pong — intended play state):
+                                // Report the play state the host INTENDS, not what it currently
+                                // is. When the host is paused only because the partner is
+                                // buffering, it still intends to be playing. Reporting
+                                // isPlaying=false in that case keeps the client permanently
+                                // paused waiting for a "play" signal that never comes (the
+                                // host won't resume until the client stops buffering, but the
+                                // client won't start until the host says isPlaying=true).
+                                val intendedPlaying = exoPlayer.isPlaying ||
+                                    (partnerIsBuffering && wasPlayingBeforeBuffer)
+                                val pong = SyncMessage(
+                                    "pong",
+                                    position = exoPlayer.currentPosition,
+                                    timestamp = msg.timestamp,
+                                    isPlaying = intendedPlaying
+                                )
                                 onSendSync(gson.toJson(pong))
                             }
                         }
@@ -220,16 +255,24 @@ fun VideoPlayer(
                                     }
                                     else -> exoPlayer.setPlaybackSpeed(1.0f)
                                 }
-                                // This also handles Bug 17: client starts paused, first
-                                // pong with isPlaying=true starts it at the right position.
-                                if (msg.isPlaying && !exoPlayer.isPlaying) exoPlayer.play()
+                                // First pong with isPlaying=true starts the client at the
+                                // correct position (Bug 17 fix). Setting hasEverStartedPlaying
+                                // here enables mid-playback buffering reports (Bug fix above).
+                                if (msg.isPlaying && !exoPlayer.isPlaying) {
+                                    hasEverStartedPlaying = true
+                                    exoPlayer.play()
+                                }
                                 if (!msg.isPlaying && exoPlayer.isPlaying) exoPlayer.pause()
                             }
                         }
                         "state", "sync" -> {
                             if (!isHost) {
                                 when (msg.action) {
-                                    "play" -> { exoPlayer.seekTo(msg.position); exoPlayer.play() }
+                                    "play" -> {
+                                        hasEverStartedPlaying = true
+                                        exoPlayer.seekTo(msg.position)
+                                        exoPlayer.play()
+                                    }
                                     "pause" -> { exoPlayer.pause(); exoPlayer.seekTo(msg.position) }
                                     "seek" -> exoPlayer.seekTo(msg.position)
                                     "position" -> if (abs(exoPlayer.currentPosition - msg.position) > 2000)
