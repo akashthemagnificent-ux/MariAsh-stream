@@ -178,6 +178,20 @@ class SimulatedRelay(private val port: Int = 9191) {
         playlist = content
     }
 
+    /**
+     * Remove a segment from the in-memory store once the host has played past it.
+     * Called by TestViewModel.evictOldSegments() as the host advances.
+     * Keeps peak relay memory at ≈ LOOK_AHEAD_SEGS × segment_size instead of
+     * growing unboundedly for the entire movie.
+     */
+    fun evictSegment(name: String) {
+        val removed = segments.remove(name)
+        if (removed != null) {
+            _segmentCount.value = segments.filter { it.key.endsWith(".mp4") }.size
+            Log.d("SimulatedRelay", "Evicted segment: $name, relay now holds ${_segmentCount.value} segments")
+        }
+    }
+
     // ── Sync relay with artificial delay ─────────────────────────
     fun sendSyncFromHost(json: String) {
         if (shouldDrop("host→client")) return

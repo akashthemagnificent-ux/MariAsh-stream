@@ -33,6 +33,25 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
     private val gson = Gson()
     private val relay = SimulatedRelay(9191)
 
+    companion object {
+        /**
+         * How many segments (each 4 seconds) to produce ahead of the host's
+         * current playback position. 30 segments = 2 minutes of look-ahead.
+         *
+         * Keeping this small prevents the segmenter from reading the entire
+         * movie into memory. A 2-hour film at 5 Mbps would otherwise produce
+         * ~1800 segments × ~2.5 MB = 4.5 GB — an instant OOM on any phone.
+         * With LOOK_AHEAD = 30, peak memory is ~30 × 2.5 MB = 75 MB.
+         */
+        private const val LOOK_AHEAD_SEGS = 30
+
+        /**
+         * Keep this many already-played segments in the relay's in-memory store
+         * (for brief seeks back). Segments older than this are evicted.
+         */
+        private const val KEEP_BEHIND_SEGS = 5
+    }
+
     // ── Network profile ──────────────────────────────────────────
     private val _currentProfile = MutableStateFlow(NetworkProfiles.INDIA_USA)
     val currentProfile: StateFlow<NetworkProfile> = _currentProfile
@@ -74,7 +93,7 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
     private val _hostReactionCmd = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val hostReactionCmd: SharedFlow<String> = _hostReactionCmd
 
-    private val _clientPartnerBuffering = MutableStateFlow(false) // host sees client buffering
+    private val _clientPartnerBuffering = MutableStateFlow(false)
     val clientPartnerBuffering: StateFlow<Boolean> = _clientPartnerBuffering
 
     private val _clientLatency = MutableStateFlow(0L)
@@ -87,7 +106,7 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
     private val _clientReactionCmd = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val clientReactionCmd: SharedFlow<String> = _clientReactionCmd
 
-    private val _hostPartnerBuffering = MutableStateFlow(false) // client sees host buffering
+    private val _hostPartnerBuffering = MutableStateFlow(false)
     val hostPartnerBuffering: StateFlow<Boolean> = _hostPartnerBuffering
 
     private val _hostLatency = MutableStateFlow(0L)
@@ -95,8 +114,14 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
 
     private var segmenter: HlsSegmenter? = null
 
+    // Running count of segments produced (read only on the segmenter thread or
+    // from the look-ahead check which is also called on the segmenter thread).
+    @Volatile private var totalSegmentsProduced = 0
+
+    // Index of the last segment evicted from the relay (so we don't evict twice)
+    private var lastEvictedSegIndex = -1
+
     init {
-        // Wire relay callbacks
         relay.onSyncToClient = { json -> viewModelScope.launch { routeToClient(json) } }
         relay.onSyncToHost   = { json -> viewModelScope.launch { routeToHost(json) } }
     }
@@ -118,32 +143,36 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         segmenter?.stop()
         _testState.value = TestState.Segmenting(0)
         _clientHlsUri.value = null
+        totalSegmentsProduced = 0
+        lastEvictedSegIndex = -1
 
         val outputDir = File(context.cacheDir, "test_hls").also {
             it.deleteRecursively(); it.mkdirs()
         }
 
-        // Bug 33 fix: stop the relay before restarting it, so NanoHTTPD doesn't
-        // throw a BindException when a second video is picked while already running.
+        // Bug 33 fix: stop existing relay before starting a new one to avoid
+        // NanoHTTPD BindException when user picks a second video.
         relay.stop()
         relay.start(_currentProfile.value)
 
-        var segCount = 0
         segmenter = HlsSegmenter(
             context = context,
             onSegmentReady = { name, file ->
+                // Read bytes NOW, while the file still exists. HlsSegmenter
+                // deletes the file immediately after this callback returns so
+                // it does NOT accumulate on disk.
                 val data = file.readBytes()
                 relay.addSegment(name, data)
-                segCount++
-                // Bug 32 fix: capture the current count in a local val BEFORE
-                // launching the coroutine. The HlsSegmenter thread continues
-                // immediately, so by the time the main thread runs the lambda
-                // segCount may already be 3, 4, … and if(segCount == 2) would
-                // never be true → clientHlsUri never set → black client panel.
-                val capturedCount = segCount
+                totalSegmentsProduced++
+
+                // Bug 32 fix: capture count before launching so main-thread
+                // coroutine sees the value at THIS moment, not whenever it runs.
+                val capturedCount = totalSegmentsProduced
                 viewModelScope.launch {
                     _testState.value = TestState.Segmenting(capturedCount)
                     if (capturedCount == 2) {
+                        // Two segments = 8 seconds buffered: enough for ExoPlayer
+                        // to start loading. Show the client player panel.
                         _clientHlsUri.value = Uri.parse(relay.hlsPlaylistUrl)
                         _testState.value = TestState.Ready
                     }
@@ -156,26 +185,65 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
                 viewModelScope.launch { _testState.value = TestState.Error(err) }
             },
             onComplete = {
-                viewModelScope.launch {
-                    if (_testState.value is TestState.Ready || _testState.value is TestState.Running) {
-                        // Done segmenting, keep running
-                    }
-                }
+                Log.d("TestVM", "Segmenting complete ($totalSegmentsProduced segments)")
             }
         )
+
+        // Look-ahead gate: the segmenter's worker thread calls this after each
+        // segment. While it returns true, the worker sleeps in 200 ms ticks.
+        //
+        // Rule: stop when more than LOOK_AHEAD_SEGS segments have been produced
+        // beyond the host's current segment index. With 4-second segments:
+        //   hostSegIndex = hostPositionMs / 4000
+        //   pause when totalSegmentsProduced > hostSegIndex + LOOK_AHEAD_SEGS
+        //
+        // This caps peak memory at ≈ LOOK_AHEAD_SEGS × segment_size_bytes and
+        // prevents the entire movie from being read into the relay's ConcurrentHashMap.
+        segmenter!!.pauseCheck = {
+            val hostSegIndex = (_hostPositionMs.value / 4_000L).toInt()
+            totalSegmentsProduced > hostSegIndex + LOOK_AHEAD_SEGS
+        }
+
         segmenter?.segment(uri, outputDir)
     }
 
     // ── Called by HOST VideoPlayer ────────────────────────────────
     fun sendSyncAsHost(json: String) = relay.sendSyncFromHost(json)
-    fun updateHostPosition(ms: Long) { _hostPositionMs.value = ms; recalcDrift() }
+
+    fun updateHostPosition(ms: Long) {
+        _hostPositionMs.value = ms
+        recalcDrift()
+        evictOldSegments(ms)
+    }
 
     // ── Called by CLIENT VideoPlayer ──────────────────────────────
     fun sendSyncAsClient(json: String) = relay.sendSyncFromClient(json)
-    fun updateClientPosition(ms: Long) { _clientPositionMs.value = ms; recalcDrift() }
+
+    fun updateClientPosition(ms: Long) {
+        _clientPositionMs.value = ms
+        recalcDrift()
+    }
 
     private fun recalcDrift() {
         _driftMs.value = abs(_hostPositionMs.value - _clientPositionMs.value)
+    }
+
+    /**
+     * Evict segments that the host has already played past so the relay's
+     * ConcurrentHashMap doesn't grow indefinitely.
+     *
+     * We keep KEEP_BEHIND_SEGS segments behind the host's current position so
+     * that brief seek-backs still work. Everything before that is removed.
+     */
+    private fun evictOldSegments(hostPositionMs: Long) {
+        val hostSegIndex = (hostPositionMs / 4_000L).toInt()
+        val evictUpTo = hostSegIndex - KEEP_BEHIND_SEGS - 1
+        if (evictUpTo <= lastEvictedSegIndex) return
+        for (i in (lastEvictedSegIndex + 1)..evictUpTo) {
+            val name = "seg_%05d.mp4".format(i)
+            relay.evictSegment(name)
+        }
+        lastEvictedSegIndex = evictUpTo
     }
 
     // ── Relay routing ─────────────────────────────────────────────
@@ -183,10 +251,6 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val msg = try { gson.fromJson(json, SyncMessage::class.java) } catch (_: Exception) { return@launch }
             when (msg.type) {
-                // Bug 23 fix: RTT was measured in routeToHost("pong") which only fires
-                // when the HOST sends a ping. But in normal flow, the CLIENT sends pings
-                // and the HOST replies with pongs that travel host→client through THIS
-                // function. So measure RTT here, on "pong" delivery to the client player.
                 "pong" -> {
                     val rtt = System.currentTimeMillis() - msg.timestamp
                     val oneWay = rtt / 2
@@ -223,6 +287,8 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         _hostPositionMs.value = 0L
         _clientPositionMs.value = 0L
         _driftMs.value = 0L
+        totalSegmentsProduced = 0
+        lastEvictedSegIndex = -1
     }
 
     override fun onCleared() {

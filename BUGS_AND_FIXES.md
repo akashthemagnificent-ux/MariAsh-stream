@@ -491,3 +491,45 @@ viewModelScope.launch {
 **Symptom:** If the user taps the video picker a second time in the test lab while segmenting is already running, `startSegmenting()` calls `relay.start()` while NanoHTTPD is still bound to port 9191, causing a `BindException` crash.  
 **Root cause:** `startSegmenting()` called `relay.start()` unconditionally without first calling `relay.stop()`.  
 **Fix:** Added `relay.stop()` immediately before `relay.start()` in `startSegmenting()`, matching the pattern used in `stopTest()`.
+
+---
+
+### Bug 34 🔴 — HlsSegmenter: no look-ahead cap → entire movie segmented at once → OOM / GC → client black screen
+**Files:** `app/…/segmenter/HlsSegmenter.kt`, `app/…/viewmodel/TestViewModel.kt`, `app/…/relay/SimulatedRelay.kt`  
+**Symptom:** The test lab status bar shows "835 segments ready (3340 s buffered)" and the cache grows to 269 MB while the client panel stays black. The app becomes sluggish and ExoPlayer never renders a frame.  
+**Root cause:**  
+`HlsSegmenter.doSegment()` loops until `MediaExtractor.readSampleData()` returns -1 (end of file). `MediaExtractor` reads at full disk speed — not at real-time video speed — so a 50-minute movie produces 750+ segments in a few seconds. All segments are stored in `SimulatedRelay.segments` (a `ConcurrentHashMap`) and on disk in `context.cacheDir`. Peak memory was 750 × ~2.5 MB ≈ 1.9 GB — well above the Android app heap limit. The resulting GC pressure stalled every other thread including ExoPlayer's decoder, leaving the client panel black.  
+**Fix (three-part):**  
+
+1. **`HlsSegmenter.kt` — `pauseCheck` gate.**  
+   A new `@Volatile var pauseCheck: (() -> Boolean)?` property was added. After each segment's `onSegmentReady` callback returns, the worker thread calls `pauseCheck()` and sleeps in 200 ms increments while it returns `true`. This is the only addition to the segmenter; everything else is in the caller.
+
+2. **`HlsSegmenter.kt` — delete segment files immediately.**  
+   `onSegmentReady(name, file)` is invoked while the file still exists. The caller reads the bytes inside the callback; the segmenter deletes the file right after the callback returns. Segment files no longer accumulate in `cacheDir`. Cache usage drops from ~270 MB for a full movie to effectively zero.
+
+3. **`TestViewModel.kt` — 30-segment look-ahead window + eviction.**  
+   `pauseCheck` is set to:
+   ```kotlin
+   { totalSegmentsProduced > (_hostPositionMs.value / 4_000L).toInt() + LOOK_AHEAD_SEGS }
+   ```
+   where `LOOK_AHEAD_SEGS = 30` (= 2 minutes). The segmenter therefore stays at most 2 minutes ahead of the host's playback position.  
+   `evictOldSegments(hostPositionMs)` removes segments the host has already played past from `SimulatedRelay.segments`, keeping only the last `KEEP_BEHIND_SEGS = 5` for brief seek-backs. `SimulatedRelay.evictSegment(name)` was added to support this.  
+   Peak relay memory is now ≈ 35 × 2.5 MB = 87 MB instead of 1.9 GB.
+
+---
+
+### Bug 35 🟡 — SyncViewModel.kt: segment files read after HlsSegmenter deletes them → FileNotFoundException
+**File:** `app/…/viewmodel/SyncViewModel.kt`  
+**Symptom:** After the Bug 34 fix (HlsSegmenter deletes segment files immediately after `onSegmentReady` returns), the old `file.readBytes()` call inside the `viewModelScope.launch {}` block would run on the main thread *after* the file was already deleted, producing a `FileNotFoundException` and silently dropping segments.  
+**Root cause:** `file.readBytes()` was inside a `viewModelScope.launch` lambda which is scheduled asynchronously. The HlsSegmenter worker thread deletes the file right after the callback returns — before the coroutine ever runs.  
+**Fix:** Read the bytes synchronously on the HlsSegmenter thread inside the `onSegmentReady` callback (before the segmenter deletes the file), store them in a `val data`, and pass `data` (not `file`) into the coroutine:
+```kotlin
+onSegmentReady = { name, file ->
+    val data = file.readBytes()          // ← read NOW, file still exists
+    viewModelScope.launch {
+        relayClient?.uploadSegment(name, data)   // ← uses in-memory bytes
+        …
+    }
+}
+```
+The same pattern was already applied in `TestViewModel`.

@@ -242,9 +242,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         hlsSegmenter = HlsSegmenter(
             context = context,
             onSegmentReady = { name, file ->
+                // Read bytes NOW while the file still exists. HlsSegmenter deletes
+                // the file immediately after this callback returns so segments do
+                // NOT accumulate on the host phone's cache storage.
+                val data = file.readBytes()
                 viewModelScope.launch {
                     try {
-                        relayClient?.uploadSegment(name, file.readBytes())
+                        relayClient?.uploadSegment(name, data)
                         _segmentsUploaded.value++
                         if (_segmentsUploaded.value == 2) {
                             sendMessage(gson.toJson(SyncMessage(type = "stream_ready", streamEpoch = _streamEpoch.value)))
@@ -267,6 +271,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             onError = { Log.e("SyncVM", "Segmenter error: $it"); viewModelScope.launch { _isSegmenting.value = false } },
             onComplete = { viewModelScope.launch { _isSegmenting.value = false } }
         )
+
+        // In relay mode we deliberately leave pauseCheck = null (no throttle).
+        // The OkHttp upload itself provides natural backpressure — each PUT is a
+        // real network request with a 60-second read timeout, so the upload
+        // coroutines queue up. Segment files are deleted immediately in
+        // onSegmentReady (above) so disk cache stays near zero even if the
+        // network is slow and many segments are produced before all uploads finish.
+        // The relay server enforces maxSegmentsPerRoom on its own side.
+
         hlsSegmenter?.segment(uri, outputDir)
     }
 

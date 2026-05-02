@@ -24,6 +24,12 @@ import kotlin.math.ceil
  * Each segment rolls on the next sync (keyframe) sample after 4 seconds.
  * As each segment finishes writing, [onSegmentReady] fires so the caller
  * can start uploading immediately without waiting for the full file to segment.
+ *
+ * Look-ahead throttle:
+ * If [pauseCheck] is set, the segmenter calls it after each segment. If it
+ * returns true the worker thread sleeps (checking every 200 ms) until either
+ * [pauseCheck] returns false or [stop] is called. This prevents the segmenter
+ * from running the entire movie into memory / disk at once.
  */
 class HlsSegmenter(
     private val context: Context,
@@ -35,6 +41,14 @@ class HlsSegmenter(
 ) {
     @Volatile private var running = false
     private var workerThread: Thread? = null
+
+    /**
+     * Optional look-ahead gate. The segmenter worker thread calls this after
+     * each segment is handed off to [onSegmentReady]. While it returns true the
+     * worker sleeps in 200 ms increments. Set from the caller's thread at any
+     * time — reads are done under a volatile read so no lock is needed.
+     */
+    @Volatile var pauseCheck: (() -> Boolean)? = null
 
     companion object {
         private const val TAG = "HlsSegmenter"
@@ -113,10 +127,34 @@ class HlsSegmenter(
                     val dur = (lastSampleUs - segmentStartUs).coerceAtLeast(0L) / 1_000_000.0
                     completedFiles.add(file)
                     completedDurations.add(dur)
+
+                    // Notify caller — caller is responsible for reading the bytes.
+                    // Bug fix: delete the file immediately after the caller has read
+                    // it so segments don't accumulate on disk (each 4-second segment
+                    // at typical movie bitrates is 0.5–3 MB; a full movie would
+                    // otherwise fill hundreds of MB of app cache).
                     onSegmentReady(file.name, file)
+                    file.delete()
+
                     onProgress(completedFiles.size)
                     onPlaylistReady(buildPlaylist(completedFiles, completedDurations, isComplete = false))
-                    Log.d(TAG, "Segment ${file.name} ready (${file.length() / 1024}KB, ${"%.2f".format(dur)}s)")
+                    Log.d(TAG, "Segment ${file.name} ready (${"%.2f".format(dur)}s)")
+
+                    // Look-ahead throttle: pause the worker thread if the caller
+                    // signals we are too far ahead of the consumer (e.g. the host's
+                    // current playback position). This prevents the entire movie from
+                    // being decoded into memory at once.
+                    val check = pauseCheck
+                    if (check != null) {
+                        var waited = 0
+                        while (running && check()) {
+                            try { Thread.sleep(200) } catch (_: InterruptedException) { running = false }
+                            waited += 200
+                            if (waited % 2000 == 0) {
+                                Log.d(TAG, "Segmenter paused (look-ahead window full), waiting…")
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -167,7 +205,6 @@ class HlsSegmenter(
 
         if (completedFiles.isNotEmpty()) {
             val finalPlaylist = buildPlaylist(completedFiles, completedDurations, isComplete = true)
-            File(outputDir, "playlist.m3u8").writeText(finalPlaylist)
             onPlaylistReady(finalPlaylist)
             Log.d(TAG, "Segmenting complete: ${completedFiles.size} segments")
             if (running) onComplete()
