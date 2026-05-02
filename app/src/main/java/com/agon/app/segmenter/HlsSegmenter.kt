@@ -39,6 +39,14 @@ class HlsSegmenter(
     companion object {
         private const val TAG = "HlsSegmenter"
         private const val SEGMENT_DURATION_US = 4_000_000L
+        // MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4 = 0 (stable since API 18).
+        // Do NOT reference MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4 directly:
+        // in Android SDK compileSdk ≥ 29 the OutputFormat @interface is declared
+        // with @Retention(RetentionPolicy.SOURCE), so its members are stripped from
+        // the class stubs. The Kotlin 2.0 K2 compiler cannot resolve them at compile
+        // time, producing "Unresolved reference 'MUXER_OUTPUT_MP4'". Using the raw
+        // integer value here is the only reliable fix.
+        private const val MUXER_OUTPUT_MP4 = 0
     }
 
     fun segment(uri: Uri, outputDir: File) {
@@ -117,7 +125,7 @@ class HlsSegmenter(
             val name = "seg_%05d.mp4".format(segmentIndex++)
             val file = File(outputDir, name)
             segmentFile = file
-            muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4)
+            muxer = MediaMuxer(file.absolutePath, MUXER_OUTPUT_MP4)
             for (track in tracks) {
                 val muxerIdx = muxer!!.addTrack(track.format)
                 trackIndexMap[track.extractorIndex] = muxerIdx

@@ -281,6 +281,140 @@ No external dependencies required — `MediaExtractor`, `MediaMuxer`, and `Media
 | 4 | `styles.xml` + `AndroidManifest.xml` | Circular style inheritance | AAPT resource link failure | Removed broken style, pointed manifest to `Theme.AgonApp` |
 | 5 | `app/build.gradle.kts` | Wrong Maven dependency coordinates (first attempt) | Gradle resolution error | Identified `com.arthenica` package is fully unavailable |
 | 6 | `build.gradle.kts` + `AgonApplication.kt` + `HlsSegmenter.kt` | Unavailable external library (permanent) | Gradle resolution error | Removed FFmpegKit entirely; rewrote with MediaExtractor+MediaMuxer |
+| 7 | `HlsSegmenter.kt` | Non-existent SDK constant | Kotlin compile error | Changed `MUXER_OUTPUT_MPEG_TS` → `MUXER_OUTPUT_MP4`; renamed segments `.ts` → `.mp4` |
+| 8 | `HlsSegmenter.kt` | Source-retention annotation constant invisible to K2 | Kotlin compile error | Defined `MUXER_OUTPUT_MP4 = 0` locally in companion object; removed `MediaMuxer.OutputFormat.*` reference |
+
+---
+
+## Bug 7 — `Unresolved reference 'MUXER_OUTPUT_MPEG_TS'` (HlsSegmenter.kt:120)
+
+### Symptom
+```
+e: HlsSegmenter.kt:120:75 Unresolved reference 'MUXER_OUTPUT_MPEG_TS'.
+FAILURE: Build failed with an exception.
+Execution failed for task ':app:compileDebugKotlin'.
+```
+
+### Root Cause
+`MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS` **does not exist** in the public
+Android SDK. The `MediaMuxer.OutputFormat` interface only defines:
+
+| Constant | Value | Since API |
+|---|---|---|
+| `MUXER_OUTPUT_MP4` | 0 | 18 |
+| `MUXER_OUTPUT_WEBM` | 1 | 21 |
+| `MUXER_OUTPUT_3GPP` | 2 | 22 |
+| `MUXER_OUTPUT_HEIF` | 3 | 28 |
+| `MUXER_OUTPUT_OGG` | 4 | 29 |
+
+There is no `MUXER_OUTPUT_MPEG_TS` in any public Android SDK release. The constant
+was added to HlsSegmenter.kt in Bug 6's fix (which removed FFmpegKit and replaced it
+with native Android MediaExtractor + MediaMuxer) but referenced a non-existent symbol.
+
+### Fix Applied
+- **HlsSegmenter.kt line 120:** `MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS`
+  → `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4`
+- **HlsSegmenter.kt line 117:** segment filename `seg_%05d.ts`
+  → `seg_%05d.mp4`
+
+ExoPlayer's `media3-exoplayer-hls` fully supports HLS playlists whose segments
+are individual MP4 files (each finalized `MediaMuxer` output is a valid, self-contained
+MP4). No playlist version change is required for VOD MP4-segment HLS.
+
+### Follow-up Runtime Fixes (same commit)
+Three additional files carried stale `.ts` / `video/MP2T` references that would
+have broken the app at runtime (not at compile time):
+
+| File | Change |
+|---|---|
+| `SimulatedRelay.kt` | Route `.mp4` segments instead of `.ts`; count `.mp4` files; serve with `video/mp4` MIME |
+| `RelayClient.kt` | Upload segments with `video/mp4` instead of `video/MP2T` |
+| `SyncViewModel.kt` | Token-patch playlist lines ending in `.mp4` instead of `.ts` |
+
+### Prevention Rules
+1. **Never reference Android SDK constants by guessing** — verify every constant in
+   the [official MediaMuxer.OutputFormat docs](https://developer.android.com/reference/android/media/MediaMuxer.OutputFormat)
+   before use.
+2. When replacing a library, audit **every file** in the project for extension strings
+   (`.ts`, `.m3u8`) and MIME types (`video/MP2T`) that the old library dictated —
+   they must all be updated together.
+3. **Do not use `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4` directly** — see Bug 8 below.
+
+---
+
+## Bug 8 — `Unresolved reference 'MUXER_OUTPUT_MP4'` (HlsSegmenter.kt:120) — PERMANENT FIX
+
+### Symptom
+```
+e: HlsSegmenter.kt:120:75 Unresolved reference 'MUXER_OUTPUT_MP4'.
+FAILURE: Build failed with an exception.
+Execution failed for task ':app:compileDebugKotlin'.
+```
+
+This error appeared **even though `MUXER_OUTPUT_MP4` is a real Android SDK constant** and
+the file correctly said `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4`. Bug 7's fix had been
+pushed (`MPEG_TS` → `MP4`) and the current source was correct, yet the build still failed.
+
+### Root Cause
+`MediaMuxer.OutputFormat` in Android SDK `compileSdk ≥ 29` is declared as a
+**`@Retention(RetentionPolicy.SOURCE)` annotation type** (`@interface`). Because its
+retention policy is `SOURCE`, the annotation type and all of its member constants are
+**stripped from the compiled `.class` stubs** inside `android.jar`. They do not exist at
+compile time in the bytecode.
+
+The **Kotlin 2.0 K2 compiler** (used in this project via `kotlin.android` version 2.0.21)
+has stricter Java interop rules than the old K1 compiler. When it tries to resolve
+`MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4`, it finds `OutputFormat` but cannot find
+`MUXER_OUTPUT_MP4` as a member because the annotation's members were stripped. K1 may have
+silently inlined these values; K2 fails explicitly.
+
+**Affected environment:**
+- `compileSdk = 35`
+- `org.jetbrains.kotlin.android` version `2.0.21` (K2 compiler)
+- `com.android.application` AGP version `8.6.0`
+
+### Fix Applied (permanent)
+Added a local constant in `HlsSegmenter.kt`'s companion object and replaced all
+references to `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4` with the local constant:
+
+```kotlin
+companion object {
+    private const val TAG = "HlsSegmenter"
+    private const val SEGMENT_DURATION_US = 4_000_000L
+    // MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4 = 0 (stable since API 18).
+    // Do NOT reference MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4 directly:
+    // in Android SDK compileSdk >= 29 the OutputFormat @interface is declared
+    // with @Retention(RetentionPolicy.SOURCE), so its members are stripped from
+    // the class stubs. The Kotlin 2.0 K2 compiler cannot resolve them at compile
+    // time, producing "Unresolved reference 'MUXER_OUTPUT_MP4'". Using the raw
+    // integer value here is the only reliable fix.
+    private const val MUXER_OUTPUT_MP4 = 0
+}
+```
+
+Usage site:
+```kotlin
+// BEFORE (fails with K2 + compileSdk >= 29):
+muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4)
+
+// AFTER (always works — integer literal, no annotation class access):
+muxer = MediaMuxer(file.absolutePath, MUXER_OUTPUT_MP4)
+```
+
+The integer values for all `MediaMuxer` output formats are documented and stable:
+
+| Constant | Integer value | Safe to hard-code? |
+|---|---|---|
+| `MUXER_OUTPUT_MP4` | `0` | Yes — stable since API 18 |
+| `MUXER_OUTPUT_WEBM` | `1` | Yes — stable since API 21 |
+| `MUXER_OUTPUT_3GPP` | `2` | Yes — stable since API 22 |
+| `MUXER_OUTPUT_HEIF` | `3` | Yes — stable since API 28 |
+| `MUXER_OUTPUT_OGG` | `4` | Yes — stable since API 29 |
+
+### Prevention Rule (CRITICAL — READ THIS BEFORE TOUCHING HlsSegmenter.kt)
+**NEVER write `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4` (or any other `MediaMuxer.OutputFormat.*` constant) in Kotlin source.** The `OutputFormat` annotation type uses source retention and is invisible to the K2 compiler at compile time. Always use the local companion object constant `MUXER_OUTPUT_MP4` (defined as `0`) or define your own `private const val` with the correct integer value.
+
+This rule applies for the lifetime of this project. Even if a future Android SDK changes the retention policy, the local constant approach is always safer and more explicit.
 
 ---
 
@@ -301,60 +435,6 @@ No external dependencies required — `MediaExtractor`, `MediaMuxer`, and `Media
 7. **`com.arthenica:ffmpeg-kit-*` and `com.antonkarpenko:ffmpeg-kit-*` are permanently unavailable.** Do not use them. Use Android's `MediaExtractor`+`MediaMuxer` for video segmentation (already implemented in `HlsSegmenter.kt`).
 
 8. **Incremental patching accumulates bugs.** Each time a file is patched by an agent, confirm that the new lines do not duplicate or conflict with existing lines in the same function. Read the surrounding 20-30 lines before making a change.
-  ---
 
-  ## Bug 7 — `Unresolved reference 'MUXER_OUTPUT_MPEG_TS'` (HlsSegmenter.kt:120)
-
-  ### Symptom
-  ```
-  e: HlsSegmenter.kt:120:75 Unresolved reference 'MUXER_OUTPUT_MPEG_TS'.
-  FAILURE: Build failed with an exception.
-  Execution failed for task ':app:compileDebugKotlin'.
-  ```
-
-  ### Root Cause
-  `MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS` **does not exist** in the public
-  Android SDK. The `MediaMuxer.OutputFormat` interface only defines:
-
-  | Constant | Value | Since API |
-  |---|---|---|
-  | `MUXER_OUTPUT_MP4` | 0 | 18 |
-  | `MUXER_OUTPUT_WEBM` | 1 | 21 |
-  | `MUXER_OUTPUT_3GPP` | 2 | 22 |
-  | `MUXER_OUTPUT_HEIF` | 3 | 28 |
-  | `MUXER_OUTPUT_OGG` | 4 | 29 |
-
-  There is no `MUXER_OUTPUT_MPEG_TS` in any public Android SDK release. The constant
-  was added to HlsSegmenter.kt in Bug 6's fix (which removed FFmpegKit and replaced it
-  with native Android MediaExtractor + MediaMuxer) but referenced a non-existent symbol.
-
-  ### Fix Applied
-  - **HlsSegmenter.kt line 120:** `MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS`
-    → `MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4`
-  - **HlsSegmenter.kt line 117:** segment filename `seg_%05d.ts`
-    → `seg_%05d.mp4`
-
-  ExoPlayer's `media3-exoplayer-hls` fully supports HLS playlists whose segments
-  are individual MP4 files (each finalized `MediaMuxer` output is a valid, self-contained
-  MP4). No playlist version change is required for VOD MP4-segment HLS.
-
-  ### Follow-up Runtime Fixes (same commit)
-  Three additional files carried stale `.ts` / `video/MP2T` references that would
-  have broken the app at runtime (not at compile time):
-
-  | File | Change |
-  |---|---|
-  | `SimulatedRelay.kt` | Route `.mp4` segments instead of `.ts`; count `.mp4` files; serve with `video/mp4` MIME |
-  | `RelayClient.kt` | Upload segments with `video/mp4` instead of `video/MP2T` |
-  | `SyncViewModel.kt` | Token-patch playlist lines ending in `.mp4` instead of `.ts` |
-
-  ### Prevention Rules
-  1. **Never reference Android SDK constants by guessing** — verify every constant in
-     the [official MediaMuxer.OutputFormat docs](https://developer.android.com/reference/android/media/MediaMuxer.OutputFormat)
-     before use.
-  2. When replacing a library, audit **every file** in the project for extension strings
-     (`.ts`, `.m3u8`) and MIME types (`video/MP2T`) that the old library dictated —
-     they must all be updated together.
-  3. Prefer `MUXER_OUTPUT_MP4` (API 18+) for HLS segments; avoid MPEG-TS with
-     MediaMuxer entirely since the standard Android SDK does not support it.
+9. **Never access `MediaMuxer.OutputFormat.*` constants directly.** `OutputFormat` is a source-retention annotation in Android SDK compileSdk ≥ 29. Its members are invisible to the Kotlin 2.0 K2 compiler. Always use the local `private const val MUXER_OUTPUT_MP4 = 0` defined in `HlsSegmenter.kt`'s companion object. Do not remove or rename that constant. See Bug 8 for full details.
   
