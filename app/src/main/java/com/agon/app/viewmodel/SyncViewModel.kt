@@ -10,6 +10,8 @@ import com.agon.app.relay.RelayClient
 import com.agon.app.relay.RelayListener
 import com.agon.app.segmenter.HlsSegmenter
 import com.google.gson.Gson
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -40,6 +42,15 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isConnected = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _isConnected
+
+    private val _isWakingServer = MutableStateFlow(false)
+    val isWakingServer: StateFlow<Boolean> = _isWakingServer
+
+    private val _wakingElapsedSeconds = MutableStateFlow(0)
+    val wakingElapsedSeconds: StateFlow<Int> = _wakingElapsedSeconds
+
+    private var disconnectCount = 0
+    private var wakingTimerJob: Job? = null
 
     private val _roomId = MutableStateFlow("")
     val roomId: StateFlow<String> = _roomId
@@ -82,6 +93,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _roomId.value = roomId
         _isHost.value = isHost
         _connectionStatus.value = "Connecting…"
+        _isWakingServer.value = false
+        _wakingElapsedSeconds.value = 0
+        disconnectCount = 0
+        wakingTimerJob?.cancel()
         this.relayToken = relayToken.trim()
 
         val baseUrl = if (relayUrl.isBlank()) "https://agon-relay.onrender.com"
@@ -97,6 +112,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     viewModelScope.launch {
                         _isConnected.value = true
                         _connectionStatus.value = "Connected"
+                        _isWakingServer.value = false
+                        _wakingElapsedSeconds.value = 0
+                        disconnectCount = 0
+                        wakingTimerJob?.cancel()
                         if (!isHost) {
                             _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, _streamEpoch.value)
                         }
@@ -106,10 +125,23 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 override fun onDisconnected(reason: String) {
                     viewModelScope.launch {
                         _isConnected.value = false
-                        _connectionStatus.value = if (
-                            reason.contains("401") || reason.contains("403") || reason.contains("Unauthorized", ignoreCase = true)
-                        ) "Authentication failed"
-                        else "Reconnecting…"
+                        val isAuthError = reason.contains("401") || reason.contains("403") ||
+                            reason.contains("Unauthorized", ignoreCase = true)
+                        _connectionStatus.value = if (isAuthError) "Authentication failed" else "Reconnecting…"
+                        if (!isAuthError) {
+                            disconnectCount++
+                            if (disconnectCount >= 2 && !_isWakingServer.value) {
+                                _isWakingServer.value = true
+                                _wakingElapsedSeconds.value = 0
+                                wakingTimerJob?.cancel()
+                                wakingTimerJob = viewModelScope.launch {
+                                    while (_isWakingServer.value && !_isConnected.value) {
+                                        delay(1_000)
+                                        _wakingElapsedSeconds.value++
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -234,6 +266,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        wakingTimerJob?.cancel()
         relayClient?.disconnect()
         hlsSegmenter?.stop()
     }

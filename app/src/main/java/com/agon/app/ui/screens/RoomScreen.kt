@@ -42,6 +42,8 @@ fun RoomScreen(
 
     val isConnected by viewModel.isConnected.collectAsState()
     val connectionStatus by viewModel.connectionStatus.collectAsState()
+    val isWakingServer by viewModel.isWakingServer.collectAsState()
+    val wakingElapsedSeconds by viewModel.wakingElapsedSeconds.collectAsState()
     val proxyUrl by viewModel.proxyUrl.collectAsState()
     val videoUri by viewModel.videoUri.collectAsState()
     val isSegmenting by viewModel.isSegmenting.collectAsState()
@@ -142,7 +144,14 @@ fun RoomScreen(
                             if (!isConnected) {
                                 CircularProgressIndicator()
                                 Spacer(Modifier.height(12.dp))
-                                Text("Waiting for partner… ($connectionStatus)")
+                                if (isWakingServer) {
+                                    Text("Waking server up… (${wakingElapsedSeconds}s)")
+                                    Text("Server was asleep — it'll be ready in ~30 s",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                } else {
+                                    Text("Waiting for partner… ($connectionStatus)")
+                                }
                             } else {
                                 Text("Partner connected!", color = MaterialTheme.colorScheme.primary)
                             }
@@ -189,6 +198,9 @@ fun RoomScreen(
             } else {
                 // ── Client view ────────────────────────────────────────
                 when {
+                    !isConnected && isWakingServer -> {
+                        WakingServerScreen(elapsedSeconds = wakingElapsedSeconds)
+                    }
                     !isConnected -> {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
