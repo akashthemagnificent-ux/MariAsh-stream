@@ -56,7 +56,7 @@ fun LocalTestScreen(testViewModel: TestViewModel = viewModel()) {
             TopAppBar(
                 title = {
                     Column {
-                        Text("Agon Test Lab", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text("MariAsh Stream Test Lab", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Text(
                             "Honest intercontinental simulation",
                             style = MaterialTheme.typography.labelSmall,

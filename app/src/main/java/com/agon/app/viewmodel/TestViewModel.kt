@@ -181,6 +181,17 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
                         timestamp = msg.timestamp, isPlaying = true)
                     relay.sendSyncFromClient(gson.toJson(pong))
                 }
+                // Bug 23 fix: RTT was measured in routeToHost("pong") which only fires
+                // when the HOST sends a ping. But in normal flow, the CLIENT sends pings
+                // and the HOST replies with pongs that travel host→client through THIS
+                // function. So measure RTT here, on "pong" delivery to the client player.
+                "pong" -> {
+                    val rtt = System.currentTimeMillis() - msg.timestamp
+                    val oneWay = rtt / 2
+                    _measuredOneWayMs.value = oneWay
+                    _clientLatency.value = oneWay
+                    _clientSyncCmd.emit(msg)
+                }
                 "buffering" -> _hostPartnerBuffering.value = (msg.action == "start")
                 else -> _clientSyncCmd.emit(msg)
             }
@@ -191,14 +202,8 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val msg = try { gson.fromJson(json, SyncMessage::class.java) } catch (_: Exception) { return@launch }
             when (msg.type) {
-                "pong" -> {
-                    val rtt = System.currentTimeMillis() - msg.timestamp
-                    val oneWay = rtt / 2
-                    _measuredOneWayMs.value = oneWay
-                    _clientLatency.value = oneWay
-                    // Deliver pong to host player for its sync correction
-                    _hostSyncCmd.emit(msg.copy(position = msg.position))
-                }
+                // "pong" from client→host path only arrives when the host sent a ping,
+                // which doesn't happen in normal flow. RTT is measured in routeToClient.
                 "buffering" -> _clientPartnerBuffering.value = (msg.action == "start")
                 else -> _hostSyncCmd.emit(msg)
             }

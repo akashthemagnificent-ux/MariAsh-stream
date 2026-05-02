@@ -99,8 +99,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         wakingTimerJob?.cancel()
         this.relayToken = relayToken.trim()
 
-        val baseUrl = if (relayUrl.isBlank()) "https://agon-relay.onrender.com"
-                      else relayUrl.trimEnd('/')
+        // Bug 19 fix: removed hardcoded "agon-relay.onrender.com" fallback.
+        // If the user hasn't entered a relay URL the connection will fail immediately
+        // with a clear error rather than silently connecting to the wrong server.
+        val baseUrl = relayUrl.trimEnd('/')
 
         relayClient = RelayClient(
             relayBaseUrl = baseUrl,
@@ -116,9 +118,13 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         _wakingElapsedSeconds.value = 0
                         disconnectCount = 0
                         wakingTimerJob?.cancel()
-                        if (!isHost) {
-                            _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, _streamEpoch.value)
-                        }
+                        // Bug 18 fix: do NOT set proxyUrl here.
+                        // Previously the client would set proxyUrl immediately on connect,
+                        // before the host had started streaming. ExoPlayer then tried to
+                        // fetch a playlist that didn't exist, entered error/retry loops,
+                        // and showed a black screen. The client now waits for the host to
+                        // send "stream_ready" (handled in handleSyncMessage below) which
+                        // guarantees at least 2 segments are available before playback starts.
                     }
                 }
                 override fun onSyncMessage(json: String) = handleSyncMessage(json, baseUrl, roomId)

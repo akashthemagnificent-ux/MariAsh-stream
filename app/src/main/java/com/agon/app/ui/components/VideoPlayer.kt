@@ -33,7 +33,7 @@ import com.google.gson.Gson
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
@@ -68,16 +68,22 @@ fun VideoPlayer(
     val partnerIsBuffering by partnerBuffering.collectAsState()
     val currentLatency by latency.collectAsState()
 
-    // 2-minute buffer, 100MB RAM cap — resilient across bad mobile connections
+    // Buffer tuned for HLS EVENT streams:
+    // minBuffer=8s  — ExoPlayer stops calling this "unhealthy" with only 2 segments ready
+    // maxBuffer=60s — keep 60s prefetched (was 120s, wastes RAM on mobile)
+    // bufferForPlayback=2s — start playing as soon as 2 seconds are downloaded
+    // bufferForPlaybackAfterRebuffer=5s — resume quickly after stall
+    // Bug 16 fix: old minBuffer=30000 forced ExoPlayer to demand 30s ahead of live edge;
+    // with 4-second segments it could never satisfy that and stayed in STATE_BUFFERING.
     val loadControl = remember {
         DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                30_000,   // min buffer: 30 seconds before playback starts
-                120_000,  // max buffer: 2 minutes always ready
-                5_000,    // buffer for initial playback start
-                10_000    // buffer after a rebuffer event
+                8_000,    // min buffer: 8 s (= 2 segments) before considered healthy
+                60_000,   // max buffer: 60 s prefetched
+                2_000,    // buffer for initial playback start
+                5_000     // buffer after a rebuffer event
             )
-            .setTargetBufferBytes(100 * 1024 * 1024)
+            .setTargetBufferBytes(50 * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
     }
@@ -93,7 +99,11 @@ fun VideoPlayer(
         LaunchedEffect(uri) {
             exoPlayer.setMediaItem(MediaItem.fromUri(uri))
             exoPlayer.prepare()
-            exoPlayer.playWhenReady = true
+            // Host plays immediately; client starts PAUSED and waits for the first
+            // sync "state play" from the host so it begins at the right position.
+            // Bug 17 fix: client with playWhenReady=true starts at position 0 while
+            // the host is already seconds ahead; desync on first load.
+            exoPlayer.playWhenReady = isHost
         }
 
         // Auto-pause if partner is buffering (host waits for client)
@@ -174,74 +184,85 @@ fun VideoPlayer(
         }
 
         // Sync command handler
+        // Bug 15/20 fix:
+        //   - Changed collectLatest → collect so no sync message is ever dropped.
+        //     collectLatest cancels the previous handler on each new arrival; with a
+        //     100ms delay inside, messages arriving within 100ms were silently lost.
+        //   - isHandlingSync is now wrapped in try/finally so it always resets even
+        //     if the coroutine is cancelled (collectLatest was leaving it true forever,
+        //     blocking the host from ever broadcasting play/pause again).
         LaunchedEffect(Unit) {
-            syncCommands.collectLatest { msg ->
+            syncCommands.collect { msg ->
                 isHandlingSync = true
-                when (msg.type) {
-                    "ping" -> {
-                        if (isHost) {
-                            val pong = SyncMessage("pong", position = exoPlayer.currentPosition,
-                                timestamp = msg.timestamp, isPlaying = exoPlayer.isPlaying)
-                            onSendSync(gson.toJson(pong))
-                        }
-                    }
-                    "pong" -> {
-                        if (!isHost) {
-                            val rtt = System.currentTimeMillis() - msg.timestamp
-                            val oneWay = rtt / 2
-                            localLatencyMs = oneWay
-                            // Correct for the transit time to estimate where host is RIGHT NOW
-                            val estimatedHostPos = msg.position + if (msg.isPlaying) oneWay else 0L
-                            val drift = abs(exoPlayer.currentPosition - estimatedHostPos)
-                            when {
-                                drift > 3000 -> exoPlayer.seekTo(estimatedHostPos)
-                                drift > 300 && msg.isPlaying -> {
-                                    exoPlayer.setPlaybackSpeed(
-                                        if (exoPlayer.currentPosition < estimatedHostPos) 1.05f else 0.95f
-                                    )
-                                }
-                                else -> exoPlayer.setPlaybackSpeed(1.0f)
-                            }
-                            if (msg.isPlaying && !exoPlayer.isPlaying) exoPlayer.play()
-                            if (!msg.isPlaying && exoPlayer.isPlaying) exoPlayer.pause()
-                        }
-                    }
-                    "state", "sync" -> {
-                        if (!isHost) {
-                            when (msg.action) {
-                                "play" -> { exoPlayer.seekTo(msg.position); exoPlayer.play() }
-                                "pause" -> { exoPlayer.pause(); exoPlayer.seekTo(msg.position) }
-                                "seek" -> exoPlayer.seekTo(msg.position)
-                                "position" -> if (abs(exoPlayer.currentPosition - msg.position) > 2000)
-                                    exoPlayer.seekTo(msg.position)
+                try {
+                    when (msg.type) {
+                        "ping" -> {
+                            if (isHost) {
+                                val pong = SyncMessage("pong", position = exoPlayer.currentPosition,
+                                    timestamp = msg.timestamp, isPlaying = exoPlayer.isPlaying)
+                                onSendSync(gson.toJson(pong))
                             }
                         }
-                    }
-                    "track" -> {
-                        if (!isHost) {
-                            val targetType = when (msg.action) {
-                                "audio" -> C.TRACK_TYPE_AUDIO
-                                "text" -> C.TRACK_TYPE_TEXT
-                                else -> -1
-                            }
-                            if (targetType != -1) {
-                                val targetIndex = msg.position.toInt().coerceAtLeast(0)
-                                val candidateGroup = availableTracks?.groups
-                                    ?.firstOrNull { it.type == targetType && targetIndex < it.length }
-                                if (candidateGroup != null) {
-                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                                        .buildUpon()
-                                        .setOverrideForType(
-                                            TrackSelectionOverride(candidateGroup.mediaTrackGroup, targetIndex)
+                        "pong" -> {
+                            if (!isHost) {
+                                val rtt = System.currentTimeMillis() - msg.timestamp
+                                val oneWay = rtt / 2
+                                localLatencyMs = oneWay
+                                // Correct for the transit time to estimate where host is RIGHT NOW
+                                val estimatedHostPos = msg.position + if (msg.isPlaying) oneWay else 0L
+                                val drift = abs(exoPlayer.currentPosition - estimatedHostPos)
+                                when {
+                                    drift > 3000 -> exoPlayer.seekTo(estimatedHostPos)
+                                    drift > 300 && msg.isPlaying -> {
+                                        exoPlayer.setPlaybackSpeed(
+                                            if (exoPlayer.currentPosition < estimatedHostPos) 1.05f else 0.95f
                                         )
-                                        .build()
+                                    }
+                                    else -> exoPlayer.setPlaybackSpeed(1.0f)
+                                }
+                                // This also handles Bug 17: client starts paused, first
+                                // pong with isPlaying=true starts it at the right position.
+                                if (msg.isPlaying && !exoPlayer.isPlaying) exoPlayer.play()
+                                if (!msg.isPlaying && exoPlayer.isPlaying) exoPlayer.pause()
+                            }
+                        }
+                        "state", "sync" -> {
+                            if (!isHost) {
+                                when (msg.action) {
+                                    "play" -> { exoPlayer.seekTo(msg.position); exoPlayer.play() }
+                                    "pause" -> { exoPlayer.pause(); exoPlayer.seekTo(msg.position) }
+                                    "seek" -> exoPlayer.seekTo(msg.position)
+                                    "position" -> if (abs(exoPlayer.currentPosition - msg.position) > 2000)
+                                        exoPlayer.seekTo(msg.position)
+                                }
+                            }
+                        }
+                        "track" -> {
+                            if (!isHost) {
+                                val targetType = when (msg.action) {
+                                    "audio" -> C.TRACK_TYPE_AUDIO
+                                    "text" -> C.TRACK_TYPE_TEXT
+                                    else -> -1
+                                }
+                                if (targetType != -1) {
+                                    val targetIndex = msg.position.toInt().coerceAtLeast(0)
+                                    val candidateGroup = availableTracks?.groups
+                                        ?.firstOrNull { it.type == targetType && targetIndex < it.length }
+                                    if (candidateGroup != null) {
+                                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                            .buildUpon()
+                                            .setOverrideForType(
+                                                TrackSelectionOverride(candidateGroup.mediaTrackGroup, targetIndex)
+                                            )
+                                            .build()
+                                    }
                                 }
                             }
                         }
                     }
+                } finally {
+                    isHandlingSync = false
                 }
-                delay(100)
-                isHandlingSync = false
             }
         }
 

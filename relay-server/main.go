@@ -18,7 +18,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────
-// Agon Relay Server — intercontinental sync & HLS relay
+// MariAsh Stream Relay Server — intercontinental sync & HLS relay
 //
 // Routes:
 //   GET  /healthz                           — health check
@@ -613,7 +613,7 @@ func main() {
 	mux.HandleFunc("/config", configHandler)
 	go cleanupRoomsLoop()
 
-	log.Printf("Agon relay server starting on :%s", port)
+	log.Printf("MariAsh Stream relay server starting on :%s", port)
 	log.Printf("Relay config: token_enabled=%t max_segments_per_room=%d max_room_bytes=%d uploads_per_minute=%d",
 		expectedRelayToken != "", maxSegmentsPerRoom, maxRoomBytes, uploadsPerMinute)
 	srv := &http.Server{

@@ -189,6 +189,10 @@ class HlsSegmenter(
         return buildString {
             appendLine("#EXTM3U")
             appendLine("#EXT-X-VERSION:3")
+            // EVENT type = play from segment 0, never seek to live edge.
+            // Without this ExoPlayer treats the playlist as a live stream and
+            // jumps to the last segment, causing black screen + stall.
+            appendLine("#EXT-X-PLAYLIST-TYPE:EVENT")
             appendLine("#EXT-X-TARGETDURATION:$targetDuration")
             appendLine("#EXT-X-MEDIA-SEQUENCE:0")
             files.forEachIndexed { i, file ->
