@@ -13,10 +13,10 @@ import kotlin.math.ceil
 
 /**
  * HlsSegmenter — splits any local video file into 4-second HLS segments using
- * Android's built-in MediaExtractor + MediaMuxer (MPEG-TS output).
+ * Android's built-in MediaExtractor + MediaMuxer (MP4 segment output).
  *
  * No re-encoding happens. Video and audio streams are copied byte-for-byte
- * (just the container changes from .mp4/.mkv to .ts). This means:
+ * (just the container is segmented into individual .mp4 files). This means:
  * — Zero quality loss (original bitrate, original FPS, original codec)
  * — Fast: no CPU-intensive work
  * — No external native libraries required (pure Android SDK)
@@ -114,10 +114,10 @@ class HlsSegmenter(
         }
 
         fun startNewSegment(startUs: Long) {
-            val name = "seg_%05d.ts".format(segmentIndex++)
+            val name = "seg_%05d.mp4".format(segmentIndex++)
             val file = File(outputDir, name)
             segmentFile = file
-            muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_TS)
+            muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MP4)
             for (track in tracks) {
                 val muxerIdx = muxer!!.addTrack(track.format)
                 trackIndexMap[track.extractorIndex] = muxerIdx
