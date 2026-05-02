@@ -260,8 +260,8 @@ fun SettingsScreen(navController: NavController) {
                     
                     DeployStep(num = 1, text = "Open render.com in your browser and sign up with email — no card needed")
                     DeployStep(num = 2, text = "Tap \"New +\" → \"Web Service\"")
-                    DeployStep(num = 3, text = "Choose \"Deploy from GitHub\" and connect the agon-relay repo")
-                    DeployStep(num = 4, text = "Select the Free plan and tap \"Create Web Service\"")
+                    DeployStep(num = 3, text = "Choose \"Deploy from GitHub\" and connect the MariAsh-Stream repo")
+                    DeployStep(num = 4, text = "Render auto-detects the Dockerfile. Select the Free plan and tap \"Create Web Service\"")
                     DeployStep(num = 5, text = "Wait ~2 minutes for first deploy. Copy the URL it gives you (ends in .onrender.com)")
                     DeployStep(num = 6, text = "Paste that URL above and tap Save. Done!")
 
@@ -278,7 +278,7 @@ fun SettingsScreen(navController: NavController) {
 
             // ── About ─────────────────────────────────────────────────
             Text(
-                "Agon v1.0 • Built for distance relationships\nNo ads. No accounts. No data collection.",
+                "MariAsh Stream v1.0 • Built for distance relationships\nNo ads. No accounts. No data collection.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.align(Alignment.CenterHorizontally)

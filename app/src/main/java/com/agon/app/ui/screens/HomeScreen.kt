@@ -41,7 +41,7 @@ fun HomeScreen(navController: NavController) {
             TopAppBar(
                 title = {
                     Column {
-                        Text("Agon", fontWeight = FontWeight.ExtraBold)
+                        Text("MariAsh Stream", fontWeight = FontWeight.ExtraBold)
                         Text("Watch together, wherever you are",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
