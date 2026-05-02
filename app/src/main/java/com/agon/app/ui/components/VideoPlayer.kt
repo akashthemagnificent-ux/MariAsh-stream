@@ -68,18 +68,31 @@ fun VideoPlayer(
     // Bug fix (buffering deadlock): client must NOT send "buffering start/stop"
     // until it has received at least one play command from the host.
     //
-    // Without this guard, the sequence is:
+    // Without this guard the sequence is:
     //   1. Client ExoPlayer enters STATE_BUFFERING immediately on prepare()
     //   2. Client sends "buffering start" — host pauses, wasPlayingBeforeBuffer=true
     //   3. Host pong: isPlaying=false (host is paused) — client stays paused
     //   4. Client stuck in STATE_BUFFERING because playWhenReady=false
     //   5. Client never exits buffering → host never resumes → permanent deadlock
-    //
-    // By gating on hasEverStartedPlaying, we break the deadlock: the host keeps
-    // playing and sends pongs with isPlaying=true, which triggers exoPlayer.play()
-    // on the client. Only AFTER that first play() does the client start reporting
-    // buffering events (for rebuffer stalls mid-playback).
     var hasEverStartedPlaying by remember { mutableStateOf(isHost) }
+
+    // Bug 36 fix (seek storm → permanent black screen):
+    //
+    // Problem: on startup the client is at position 0 while the host may be
+    // tens of seconds ahead. drift > 3 000 ms is ALWAYS true. Every pong
+    // (arriving every ~2.5 s) fires seekTo(estimatedHostPos). Each seek makes
+    // ExoPlayer abandon its in-progress segment download and restart from the
+    // new position. With a simulated 10 Mbps link a single 15 MB segment takes
+    // ~12 s to download — but seeks arrive every 2.5 s. The client can never
+    // finish loading a single segment and stays in STATE_BUFFERING forever.
+    //
+    // Fix: allow at most ONE startup seek (before the client has played even
+    // one frame). After that seek, suppress further seeks until ExoPlayer is
+    // actually producing frames (exoPlayer.isPlaying == true). The one seek
+    // aligns the client to the host's position; ExoPlayer then fills its buffer
+    // undisturbed. Mid-playback drift > 3 s still triggers an immediate seek —
+    // that corrects real desync after a network stall or host scrub.
+    var hasSeekedForStartup by remember { mutableStateOf(isHost) }
 
     val partnerIsBuffering by partnerBuffering.collectAsState()
     val currentLatency by latency.collectAsState()
@@ -89,8 +102,7 @@ fun VideoPlayer(
     // maxBuffer=60s — keep 60s prefetched (was 120s, wastes RAM on mobile)
     // bufferForPlayback=2s — start playing as soon as 2 seconds are downloaded
     // bufferForPlaybackAfterRebuffer=5s — resume quickly after stall
-    // Bug 16 fix: old minBuffer=30000 forced ExoPlayer to demand 30s ahead of live edge;
-    // with 4-second segments it could never satisfy that and stayed in STATE_BUFFERING.
+    // Bug 16 fix: old minBuffer=30000 forced ExoPlayer to demand 30s ahead of live edge.
     val loadControl = remember {
         DefaultLoadControl.Builder()
             .setBufferDurationsMs(
@@ -207,11 +219,7 @@ fun VideoPlayer(
         // Sync command handler
         // Bug 15/20 fix:
         //   - Changed collectLatest → collect so no sync message is ever dropped.
-        //     collectLatest cancels the previous handler on each new arrival; with a
-        //     100ms delay inside, messages arriving within 100ms were silently lost.
-        //   - isHandlingSync is now wrapped in try/finally so it always resets even
-        //     if the coroutine is cancelled (collectLatest was leaving it true forever,
-        //     blocking the host from ever broadcasting play/pause again).
+        //   - isHandlingSync is now wrapped in try/finally so it always resets.
         LaunchedEffect(Unit) {
             syncCommands.collect { msg ->
                 isHandlingSync = true
@@ -222,11 +230,7 @@ fun VideoPlayer(
                                 // Bug fix (host pong — intended play state):
                                 // Report the play state the host INTENDS, not what it currently
                                 // is. When the host is paused only because the partner is
-                                // buffering, it still intends to be playing. Reporting
-                                // isPlaying=false in that case keeps the client permanently
-                                // paused waiting for a "play" signal that never comes (the
-                                // host won't resume until the client stops buffering, but the
-                                // client won't start until the host says isPlaying=true).
+                                // buffering, it still intends to be playing.
                                 val intendedPlaying = exoPlayer.isPlaying ||
                                     (partnerIsBuffering && wasPlayingBeforeBuffer)
                                 val pong = SyncMessage(
@@ -246,8 +250,20 @@ fun VideoPlayer(
                                 // Correct for the transit time to estimate where host is RIGHT NOW
                                 val estimatedHostPos = msg.position + if (msg.isPlaying) oneWay else 0L
                                 val drift = abs(exoPlayer.currentPosition - estimatedHostPos)
+
+                                // Bug 36 fix: guard against seek storm during startup.
+                                // See hasSeekedForStartup declaration above for full explanation.
                                 when {
-                                    drift > 3000 -> exoPlayer.seekTo(estimatedHostPos)
+                                    drift > 3000 && exoPlayer.isPlaying -> {
+                                        // Mid-playback: seek immediately to correct real desync
+                                        exoPlayer.seekTo(estimatedHostPos)
+                                    }
+                                    drift > 3000 && !hasSeekedForStartup && msg.isPlaying -> {
+                                        // Startup: seek ONCE to align with host, then let
+                                        // ExoPlayer buffer undisturbed until isPlaying=true.
+                                        exoPlayer.seekTo(estimatedHostPos)
+                                        hasSeekedForStartup = true
+                                    }
                                     drift > 300 && msg.isPlaying -> {
                                         exoPlayer.setPlaybackSpeed(
                                             if (exoPlayer.currentPosition < estimatedHostPos) 1.05f else 0.95f
@@ -255,9 +271,10 @@ fun VideoPlayer(
                                     }
                                     else -> exoPlayer.setPlaybackSpeed(1.0f)
                                 }
+
                                 // First pong with isPlaying=true starts the client at the
                                 // correct position (Bug 17 fix). Setting hasEverStartedPlaying
-                                // here enables mid-playback buffering reports (Bug fix above).
+                                // here enables mid-playback buffering reports.
                                 if (msg.isPlaying && !exoPlayer.isPlaying) {
                                     hasEverStartedPlaying = true
                                     exoPlayer.play()
@@ -270,6 +287,7 @@ fun VideoPlayer(
                                 when (msg.action) {
                                     "play" -> {
                                         hasEverStartedPlaying = true
+                                        hasSeekedForStartup = true
                                         exoPlayer.seekTo(msg.position)
                                         exoPlayer.play()
                                     }

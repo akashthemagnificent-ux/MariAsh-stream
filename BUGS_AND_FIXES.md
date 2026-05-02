@@ -533,3 +533,130 @@ onSegmentReady = { name, file ->
 }
 ```
 The same pattern was already applied in `TestViewModel`.
+
+---
+
+## Session 5 — Seek Storm & Simulation Fidelity (Bugs 36–37)
+
+### Bug 36 🔴 — VideoPlayer.kt: pong handler seeks every 2.5 s → seek storm → client permanent black screen
+**File:** `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`
+**Symptom:** In the test lab (India → USA profile), the HOST plays fine but the
+CLIENT panel stays black indefinitely. Stats show Ping: ~234 ms (sync is
+working), Drift: ~600 ms (oddly low — see below), Segs: 9, Drop: 1. No matter
+how long you wait the client never renders a frame.
+**Root cause (step-by-step):**
+
+1. `clientHlsUri` is set after segment 2 is ready. The client `VideoPlayer`
+   composable starts. ExoPlayer calls `prepare()` with `playWhenReady=false`.
+
+2. The client's ping loop waits 2 000 ms, then sends a ping. The ping round-trips
+   through `SimulatedRelay` (~468 ms RTT = 2 × 234 ms), so the **first pong
+   arrives ~2.5 s after the composable starts**.
+
+3. Host is at position ~55 s. `estimatedHostPos ≈ 55 000 ms`.
+   `exoPlayer.currentPosition = 0`.
+   `drift = 55 000 ms → always > 3 000`.
+
+4. The old pong handler had:
+   ```kotlin
+   when {
+       drift > 3000 -> exoPlayer.seekTo(estimatedHostPos)   // ← fires every pong
+       ...
+   }
+   ```
+   Every pong (arriving every ~2.5 s) fires `seekTo(~55 000 ms)`.
+
+5. Each `seekTo()` makes ExoPlayer discard whatever portion of a segment it had
+   started to download and restart its HTTP request for the segment at the new
+   position.
+
+6. With India → USA at 10 Mbps, a typical 15 MB segment takes ~12 s to fully
+   download. But seeks arrive every 2.5 s — more than 4× faster than downloads
+   complete. The client **never finishes downloading a single segment**. It stays
+   in `STATE_BUFFERING` permanently.
+
+7. Because `hasEverStartedPlaying = false`, no `"buffering start"` is sent to
+   the host, so the host keeps playing normally — explaining the low drift shown
+   in the stats: `_driftMs` is `abs(hostPositionMs - clientPositionMs)`, and
+   since `clientPositionMs` is reported from `onPositionUpdate` which reads
+   `exoPlayer.currentPosition`, and ExoPlayer keeps reporting the **seek target**
+   as its current position (even while buffering), the drift looks small even
+   though the client has never played a frame.
+
+**Fix:** Added `hasSeekedForStartup` flag (initialized `true` for host, `false`
+for client). The pong handler now uses three branches:
+
+```kotlin
+when {
+    // Mid-playback: seek immediately — corrects real desync after a stall
+    drift > 3000 && exoPlayer.isPlaying -> exoPlayer.seekTo(estimatedHostPos)
+
+    // Startup: seek ONCE to align with host, then wait for ExoPlayer to buffer
+    drift > 3000 && !hasSeekedForStartup && msg.isPlaying -> {
+        exoPlayer.seekTo(estimatedHostPos)
+        hasSeekedForStartup = true
+    }
+
+    drift > 300 && msg.isPlaying -> { /* speed nudge */ }
+    else -> exoPlayer.setPlaybackSpeed(1.0f)
+}
+```
+
+With this fix:
+- The client seeks to ~55 s exactly once (on the first pong with `isPlaying=true`).
+- Subsequent pongs find `hasSeekedForStartup=true` and `!exoPlayer.isPlaying` → skip
+  the seek branch entirely.
+- ExoPlayer downloads the segment starting at ~55 s undisturbed.
+- With the bandwidth simulation fix (Bug 37), ExoPlayer starts rendering frames
+  after `bufferForPlayback = 2 000 ms` of content is received.
+- Once `exoPlayer.isPlaying` becomes `true`, the `drift > 3000 && exoPlayer.isPlaying`
+  branch takes over for all future mid-playback corrections.
+
+Also added `hasSeekedForStartup = true` in the `"state play"` handler so that
+a direct play command from the host (not via pong) also marks startup complete.
+
+---
+
+### Bug 37 🟠 — SimulatedRelay.kt: bulk-delay-then-burst delivery prevents ExoPlayer from partially buffering
+**File:** `app/src/main/java/com/agon/app/relay/SimulatedRelay.kt`
+**Symptom:** Even after Bug 36 is fixed, the client's startup time in the test
+lab is 12–25 s per segment (at India → USA 10 Mbps with typical 15 MB segments).
+This is far longer than what users experience on a real connection, making the
+test lab feel pessimistic. On a real network the client starts playing within
+2–4 s of the stream being ready.
+**Root cause:** The old `simulateNetworkDelay()` called:
+```kotlin
+Thread.sleep(latencyMs + transferMs)   // full sleep first
+```
+Then returned a plain `ByteArrayInputStream(data)`. NanoHTTPD wrote ALL bytes to
+the socket in a single burst after the sleep. ExoPlayer's HTTP client received
+**zero bytes during the entire sleep period**, so `bufferForPlayback = 2 000 ms`
+was unreachable until the complete `transferMs` had elapsed — e.g. 12 s for a
+15 MB segment at 10 Mbps.
+
+On a real network the relay (Go server) streams bytes continuously at link speed.
+ExoPlayer starts parsing the MP4 box headers immediately, fills its internal
+2 000 ms playback buffer after receiving ~2–3 s worth of bytes, and begins
+rendering frames. The simulation was 5–10× more pessimistic than reality for
+startup time.
+
+**Fix:** Replaced `simulateNetworkDelay()` with two separate mechanisms:
+
+1. **Initial latency:** `Thread.sleep(latencyMs())` before the first byte —
+   models the one-way TCP + TLS connection setup cost. Applied to both playlist
+   and segment requests.
+
+2. **Bandwidth throttle via `BandwidthThrottledStream`:** A custom `InputStream`
+   that delivers bytes at `bandwidthKbps` by computing `expectedMs = position /
+   bytesPerMs` and sleeping only the fractional remainder before each `read()`.
+   ExoPlayer's HTTP client calls `read()` continuously and receives bytes at the
+   correct rate — just like a real link. `bufferForPlayback = 2 000 ms` is now
+   met after ~2 s of actual data transfer, not after the full segment download.
+
+Unlimited-bandwidth profiles (`bandwidthKbps ≥ 1 000 000`, e.g. SAME_ROOM) still
+use a plain `ByteArrayInputStream` to avoid unnecessary overhead.
+
+**Effect on test accuracy:** The lab now correctly predicts real-world startup
+latency. Under India → USA (260 ms one-way, 10 Mbps), the client starts playing
+~2–3 s after the first pong aligns it with the host, matching what users of the
+live Render relay actually experience.

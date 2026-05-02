@@ -5,6 +5,7 @@ import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.ByteArrayInputStream
+import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
@@ -58,6 +59,71 @@ object NetworkProfiles {
 }
 
 // ─────────────────────────────────────────────────
+// BandwidthThrottledStream — Bug 37 fix
+//
+// The old simulation used Thread.sleep(totalDelayMs) THEN returned all bytes
+// at once via a plain ByteArrayInputStream. NanoHTTPD wrote all bytes to the
+// socket in a single burst after the sleep. ExoPlayer receives no bytes during
+// the sleep, so bufferForPlayback=2 s is unreachable until the entire
+// sleep duration elapses — even if only half a segment has "arrived". For a
+// 15 MB segment at 10 Mbps that's a ~12-second black wait before ExoPlayer
+// can even attempt to start playing.
+//
+// In reality the Go relay streams bytes continuously at network speed.
+// ExoPlayer starts parsing and buffering immediately. bufferForPlayback=2 s
+// is met after ~2 s of content is received, not after the full segment download.
+//
+// Fix: stream bytes to ExoPlayer at the correct rate (bandwidthKbps) by
+// throttling the InputStream. After the initial latency sleep (applied in
+// serveSegment before this stream is created), each read() call checks how
+// many bytes *should* have arrived by now and sleeps only the fractional
+// remainder. ExoPlayer's HTTP client receives data incrementally, matching
+// how a real network delivers a large file.
+// ─────────────────────────────────────────────────
+private class BandwidthThrottledStream(
+    private val data: ByteArray,
+    bandwidthKbps: Int   // 0 or negative = unlimited (loopback speed)
+) : InputStream() {
+
+    // bytes per millisecond allowed by the bandwidth cap
+    private val bytesPerMs: Double =
+        if (bandwidthKbps > 0) bandwidthKbps.toDouble() * 1000.0 / 8_000.0
+        else Double.MAX_VALUE
+
+    private var position = 0
+    private val startMs = System.currentTimeMillis()
+
+    override fun read(): Int {
+        if (position >= data.size) return -1
+        throttleTo(position + 1)
+        return data[position++].toInt() and 0xFF
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (position >= data.size) return -1
+        val toRead = minOf(len, data.size - position)
+        throttleTo(position + toRead)
+        System.arraycopy(data, position, b, off, toRead)
+        position += toRead
+        return toRead
+    }
+
+    override fun available(): Int = data.size - position
+
+    // Sleep until the wall-clock time matches how long it should take to
+    // deliver `targetPosition` bytes at the configured bandwidth.
+    private fun throttleTo(targetPosition: Int) {
+        if (bytesPerMs == Double.MAX_VALUE) return
+        val expectedMs = (targetPosition.toDouble() / bytesPerMs).toLong()
+        val elapsedMs = System.currentTimeMillis() - startMs
+        val sleepMs = expectedMs - elapsedMs
+        if (sleepMs > 0) {
+            try { Thread.sleep(sleepMs) } catch (_: InterruptedException) {}
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────
 // SimulatedRelay — honest in-process continent simulation
 // ─────────────────────────────────────────────────
 class SimulatedRelay(private val port: Int = 9191) {
@@ -104,7 +170,11 @@ class SimulatedRelay(private val port: Int = 9191) {
         }
 
         private fun servePlaylist(): Response {
-            simulateNetworkDelay(isLargePayload = false)
+            // Apply one-way latency + jitter for the playlist request (tiny payload,
+            // no bandwidth throttle needed).
+            val latency = latencyMs()
+            if (latency > 0) try { Thread.sleep(latency) } catch (_: InterruptedException) {}
+
             if (playlist.isEmpty()) {
                 return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE,
                     "text/plain", "Playlist not ready yet")
@@ -124,13 +194,28 @@ class SimulatedRelay(private val port: Int = 9191) {
                 ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain",
                     "Segment $name not available yet")
 
-            simulateNetworkDelay(isLargePayload = true, byteCount = data.size)
+            // Bug 37 fix: apply ONLY the initial latency delay here (as a blocking
+            // sleep before the first byte is sent). The bandwidth throttle is
+            // handled by BandwidthThrottledStream, which drips bytes at the correct
+            // rate. This matches real network behaviour: the TCP connection itself
+            // has an RTT cost (≈ latency), then bytes stream in continuously at
+            // the link speed.
+            val latency = latencyMs()
+            if (latency > 0) try { Thread.sleep(latency) } catch (_: InterruptedException) {}
+
             _downloadedBytes.value += data.size
+
+            val stream: InputStream =
+                if (profile.bandwidthKbps < 1_000_000) {
+                    BandwidthThrottledStream(data, profile.bandwidthKbps)
+                } else {
+                    ByteArrayInputStream(data)   // LAN / unlimited: no throttle
+                }
 
             return newFixedLengthResponse(
                 Response.Status.OK,
                 "video/mp4",
-                ByteArrayInputStream(data),
+                stream,
                 data.size.toLong()
             ).also {
                 it.addHeader("Cache-Control", "no-cache")
@@ -181,8 +266,6 @@ class SimulatedRelay(private val port: Int = 9191) {
     /**
      * Remove a segment from the in-memory store once the host has played past it.
      * Called by TestViewModel.evictOldSegments() as the host advances.
-     * Keeps peak relay memory at ≈ LOOK_AHEAD_SEGS × segment_size instead of
-     * growing unboundedly for the entire movie.
      */
     fun evictSegment(name: String) {
         val removed = segments.remove(name)
@@ -212,33 +295,19 @@ class SimulatedRelay(private val port: Int = 9191) {
     }
 
     // ── Network simulation helpers ────────────────────────────────
-    private fun simulateNetworkDelay(isLargePayload: Boolean, byteCount: Int = 0) {
-        var totalDelayMs = profile.oneWayLatencyMs
 
-        // Jitter
-        if (profile.jitterMs > 0) {
-            totalDelayMs += (Random.nextLong(profile.jitterMs * 2) - profile.jitterMs)
-            totalDelayMs = totalDelayMs.coerceAtLeast(0)
-        }
-
-        // Bandwidth throttle for large payloads (segments)
-        if (isLargePayload && byteCount > 0 && profile.bandwidthKbps < 1_000_000) {
-            val transferMs = (byteCount.toLong() * 8L * 1000L) / (profile.bandwidthKbps.toLong() * 1000L)
-            totalDelayMs += transferMs
-        }
-
-        if (totalDelayMs > 0) {
-            try { Thread.sleep(totalDelayMs) } catch (_: InterruptedException) { }
-        }
-    }
-
-    private fun delayMs(): Long {
+    // Returns one-way latency + jitter (used for both sync messages and the
+    // initial TCP-connection-cost delay before the first byte of a segment).
+    private fun latencyMs(): Long {
         var d = profile.oneWayLatencyMs
         if (profile.jitterMs > 0) {
             d += (Random.nextLong(profile.jitterMs * 2) - profile.jitterMs)
         }
         return d.coerceAtLeast(0)
     }
+
+    // Alias used by the sync message threads (same calculation).
+    private fun delayMs(): Long = latencyMs()
 
     private fun shouldDrop(direction: String): Boolean {
         if (profile.packetLossPercent == 0) return false
