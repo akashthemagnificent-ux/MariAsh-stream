@@ -60,7 +60,6 @@ fun RoomScreen(
     }
 
     LaunchedEffect(roomId, relayUrl, relayToken) {
-    LaunchedEffect(roomId) {
         viewModel.initRoom(roomId, isHost, relayUrl, relayToken)
     }
 
