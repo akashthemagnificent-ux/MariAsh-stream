@@ -87,8 +87,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
     implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
 
-    // FFmpegKit — remuxes local movie to HLS segments, zero re-encoding
-    implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2")
+    // HLS segmentation uses Android's built-in MediaExtractor + MediaMuxer (no external lib needed)
 
     // OkHttp — WebSocket for sync messages + HTTP for segment uploads
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

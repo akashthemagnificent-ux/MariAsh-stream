@@ -213,12 +213,61 @@ All methods used in the codebase exist in 6.0-2:
 2. The artifact version actually exists on the declared repositories (verify on https://search.maven.org or https://mvnrepository.com).
 3. Do not substitute a JitPack fork (`com.github.*` or other group) unless the fork explicitly guarantees the same package namespace.
 
-The canonical FFmpegKit dependency for code that uses `com.arthenica.ffmpegkit.*` is always:
-```kotlin
-implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2")   // full GPL build (for remuxing)
-// OR
-implementation("com.arthenica:ffmpeg-kit-min:6.0-2")         // minimal build (no GPL codecs)
+**CORRECTION**: The `com.arthenica:ffmpeg-kit-full-gpl:6.0-2` dependency was attempted but also failed — see Bug 6 below for the definitive resolution.
+
+---
+
+## Bug 6 — FFmpegKit (`com.arthenica:ffmpeg-kit-full-gpl`) Is Completely Unavailable (Permanent Fix)
+
+### Files
+- `app/build.gradle.kts`
+- `app/src/main/java/com/agon/app/AgonApplication.kt`
+- `app/src/main/java/com/agon/app/segmenter/HlsSegmenter.kt`
+
+### What was wrong
+After correcting the group ID from `com.antonkarpenko` to `com.arthenica`, the build still failed:
+
 ```
+> Could not find com.arthenica:ffmpeg-kit-full-gpl:6.0-2.
+  Searched in the following locations:
+    - https://dl.google.com/dl/android/maven2/.../ffmpeg-kit-full-gpl-6.0-2.pom
+    - https://repo.maven.apache.org/maven2/.../ffmpeg-kit-full-gpl-6.0-2.pom
+    - https://jitpack.io/.../ffmpeg-kit-full-gpl-6.0-2.pom
+```
+
+Root cause: The `arthenica/ffmpeg-kit` project was **permanently archived** in early 2024. Its packages were hosted on GitHub Packages (`https://maven.pkg.github.com/arthenica/ffmpeg-kit`), NOT on Maven Central. Both the GitHub Packages endpoint and Maven Central all return 404 for every version of `com.arthenica:ffmpeg-kit-*`. The package simply no longer exists anywhere.
+
+Investigation confirmed:
+- `repo.maven.apache.org` → 404 for all arthenica versions
+- `maven.pkg.github.com/arthenica/ffmpeg-kit` → 404 even with auth
+- GitHub release assets for `v6.0.LTS` → no AAR attachments
+- `com.antonkarpenko:ffmpeg-kit-full-gpl:2.1.0` (JitPack fork) → AAR resolves but provides native `.so` files ONLY, no `com.arthenica.ffmpegkit.*` Java classes in compilation classpath
+
+### Fix Applied
+Removed the FFmpegKit dependency entirely and replaced `HlsSegmenter.kt` with a pure Android SDK implementation using `MediaExtractor` + `MediaMuxer` (MPEG-TS output format).
+
+#### `app/build.gradle.kts`
+```kotlin
+// REMOVED: implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2")
+// HLS segmentation now uses Android's built-in MediaExtractor + MediaMuxer
+```
+
+#### `AgonApplication.kt`
+Removed the `FFmpegKitConfig.setLogLevel(...)` call — it was only a log verbosity hint.
+
+#### `HlsSegmenter.kt`
+Replaced the entire file with a `MediaExtractor` + `MediaMuxer` implementation:
+- `MediaExtractor.setDataSource(context, uri, null)` — reads any URI the OS can open (SAF, content://, file://)
+- All video and audio tracks are discovered and selected
+- `MediaMuxer(path, MUXER_OUTPUT_MPEG_TS)` — writes each segment as a valid `.ts` file
+- Segment boundaries are placed on the next sync (I-frame) sample after 4 seconds elapsed
+- M3U8 playlist is built and emitted after each segment (live append mode)
+- All callbacks (`onSegmentReady`, `onPlaylistReady`, `onProgress`, `onError`, `onComplete`) preserved with identical signatures
+
+No external dependencies required — `MediaExtractor`, `MediaMuxer`, and `MediaCodec.BufferInfo` are all part of Android API 21+ (minSdk = 24 in this project).
+
+### Prevention Rule
+**Do not add dependencies on the `com.arthenica:ffmpeg-kit-*` or `com.antonkarpenko:ffmpeg-kit-*` family of packages.** These are permanently unavailable as of 2024. For video remuxing/segmentation tasks in this project, use Android's `MediaExtractor` + `MediaMuxer` API (already implemented in `HlsSegmenter.kt`).
 
 ---
 
@@ -230,7 +279,8 @@ implementation("com.arthenica:ffmpeg-kit-min:6.0-2")         // minimal build (n
 | 2 | `RelayClient.kt` | Dead code after `throw` | Unreachable code / stale patch | Removed code lines after the unconditional `throw` |
 | 3 | `RoomScreen.kt` | Composable in coroutine + unbalanced braces | Compose plugin error + Kotlin syntax error | Removed the wrapping outer `LaunchedEffect`, fixed keys |
 | 4 | `styles.xml` + `AndroidManifest.xml` | Circular style inheritance | AAPT resource link failure | Removed broken style, pointed manifest to `Theme.AgonApp` |
-| 5 | `app/build.gradle.kts` | Wrong Maven dependency coordinates | Kotlin compile error (unresolved references) | Changed to `com.arthenica:ffmpeg-kit-full-gpl:6.0-2` |
+| 5 | `app/build.gradle.kts` | Wrong Maven dependency coordinates (first attempt) | Gradle resolution error | Identified `com.arthenica` package is fully unavailable |
+| 6 | `build.gradle.kts` + `AgonApplication.kt` + `HlsSegmenter.kt` | Unavailable external library (permanent) | Gradle resolution error | Removed FFmpegKit entirely; rewrote with MediaExtractor+MediaMuxer |
 
 ---
 
@@ -246,6 +296,8 @@ implementation("com.arthenica:ffmpeg-kit-min:6.0-2")         // minimal build (n
 
 5. **After any Kotlin/XML edit, verify brace/tag balance.** An unclosed `{` in Kotlin or an unclosed tag in XML will always fail the build with a cryptic parser error. Count your opens and closes.
 
-6. **Match Maven group ID to the import package namespace.** The `groupId` in a Gradle dependency must correspond to the top-level Java package the code imports. Verify the artifact exists before using it.
+6. **Match Maven group ID to the import package namespace, and verify the artifact actually exists.** Check `https://search.maven.org` or `https://repo1.maven.org/maven2/` directly before adding any dependency. A 404 from the POM URL means the artifact is unavailable regardless of what the search index shows.
 
-7. **Incremental patching accumulates bugs.** Each time a file is patched by an agent, confirm that the new lines do not duplicate or conflict with existing lines in the same function. Read the surrounding 20-30 lines before making a change.
+7. **`com.arthenica:ffmpeg-kit-*` and `com.antonkarpenko:ffmpeg-kit-*` are permanently unavailable.** Do not use them. Use Android's `MediaExtractor`+`MediaMuxer` for video segmentation (already implemented in `HlsSegmenter.kt`).
+
+8. **Incremental patching accumulates bugs.** Each time a file is patched by an agent, confirm that the new lines do not duplicate or conflict with existing lines in the same function. Read the surrounding 20-30 lines before making a change.
