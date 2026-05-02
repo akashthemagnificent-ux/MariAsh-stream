@@ -298,6 +298,7 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "role already connected", http.StatusConflict)
 		return
 	}
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
