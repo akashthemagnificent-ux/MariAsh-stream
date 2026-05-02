@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"net"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -290,14 +290,14 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	room := getOrCreateRoom(roomId)
+
+	// Bug 26 fix: always reject if reserve() fails, regardless of whether
+	// the slot is occupied by a live connection or just pending an upgrade.
+	// The previous code fell through when slot was "pending" (not nil), which
+	// allowed two goroutines to race past the check and both become host/client.
 	if !room.reserve(role) {
-	room.mu.RLock()
-	roleOccupied := (role == "host" && room.host != nil) || (role == "client" && room.client != nil)
-	room.mu.RUnlock()
-	if roleOccupied {
-		http.Error(w, "role already connected", http.StatusConflict)
+		http.Error(w, "role already taken", http.StatusConflict)
 		return
-	}
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -309,14 +309,9 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	room.touch()
+	// Bug 27 fix: commit() already sets room.host/client and clears pending flag.
+	// Removed the duplicate room.mu.Lock+set block that followed it.
 	room.commit(role, conn)
-	room.mu.Lock()
-	if role == "host" {
-		room.host = conn
-	} else {
-		room.client = conn
-	}
-	room.mu.Unlock()
 
 	log.Printf("[%s] %s connected", roomId, role)
 
@@ -370,6 +365,28 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	room.mu.Unlock()
 	room.touch()
+
+	// Bug 28 fix: notify the other side when a peer disconnects so they can
+	// show a "Host/client has left" screen instead of an infinite buffering
+	// spinner. We send a JSON message of type "peer_left" with the role that
+	// left, then immediately close the target's connection so they reconnect.
+	room.mu.RLock()
+	var other *websocket.Conn
+	if role == "host" {
+		other = room.client
+	} else {
+		other = room.host
+	}
+	room.mu.RUnlock()
+	if other != nil {
+		msg := fmt.Sprintf(`{"type":"peer_left","action":"%s"}`, role)
+		other.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		other.WriteMessage(websocket.TextMessage, []byte(msg))
+		log.Printf("[%s] notified %s that %s left", roomId, func() string {
+			if role == "host" { return "client" }
+			return "host"
+		}(), role)
+	}
 }
 
 // ─────────────────────────────────────────────────
@@ -526,10 +543,10 @@ func cleanupRoomsLoop() {
 }
 
 type relayStats struct {
-	Rooms            int `json:"rooms"`
-	ConnectedHosts   int `json:"connected_hosts"`
-	ConnectedClients int `json:"connected_clients"`
-	TotalSegments    int `json:"total_segments"`
+	Rooms            int   `json:"rooms"`
+	ConnectedHosts   int   `json:"connected_hosts"`
+	ConnectedClients int   `json:"connected_clients"`
+	TotalSegments    int   `json:"total_segments"`
 	TotalBytes       int64 `json:"total_bytes"`
 }
 

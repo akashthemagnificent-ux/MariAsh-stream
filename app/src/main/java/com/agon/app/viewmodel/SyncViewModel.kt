@@ -72,10 +72,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isSegmenting = MutableStateFlow(false)
     val isSegmenting: StateFlow<Boolean> = _isSegmenting
+
     private val _streamEpoch = MutableStateFlow(0L)
     val streamEpoch: StateFlow<Long> = _streamEpoch
 
-    // Fixed: partnerBuffering and latency were missing — VideoPlayer needs these
     private val _partnerBuffering = MutableStateFlow(false)
     val partnerBuffering: StateFlow<Boolean> = _partnerBuffering
 
@@ -88,6 +88,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private val _reactionCommand = MutableSharedFlow<String>(extraBufferCapacity = 32)
     val reactionCommand: SharedFlow<String> = _reactionCommand
 
+    // Bug 28 fix: null = nobody left, non-null = message to display
+    private val _hostLeft = MutableStateFlow<String?>(null)
+    val hostLeft: StateFlow<String?> = _hostLeft
+
+    // Bug 30 fix: remember the last web URL set by the host so we can
+    // re-send it when the relay connection becomes established (setWebUrl
+    // might be called before the WebSocket handshake completes, and
+    // sendSync drops messages silently when connected=false).
+    private var pendingWebUrl: String? = null
+    private var pendingWebEpoch: Long = 0L
+
     fun initRoom(roomId: String, isHost: Boolean, relayUrl: String = "", relayToken: String = "") {
         relayClient?.disconnect()
         _roomId.value = roomId
@@ -97,11 +108,9 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _wakingElapsedSeconds.value = 0
         disconnectCount = 0
         wakingTimerJob?.cancel()
+        _hostLeft.value = null
         this.relayToken = relayToken.trim()
 
-        // Bug 19 fix: removed hardcoded "agon-relay.onrender.com" fallback.
-        // If the user hasn't entered a relay URL the connection will fail immediately
-        // with a clear error rather than silently connecting to the wrong server.
         val baseUrl = relayUrl.trimEnd('/')
 
         relayClient = RelayClient(
@@ -118,13 +127,19 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         _wakingElapsedSeconds.value = 0
                         disconnectCount = 0
                         wakingTimerJob?.cancel()
-                        // Bug 18 fix: do NOT set proxyUrl here.
-                        // Previously the client would set proxyUrl immediately on connect,
-                        // before the host had started streaming. ExoPlayer then tried to
-                        // fetch a playlist that didn't exist, entered error/retry loops,
-                        // and showed a black screen. The client now waits for the host to
-                        // send "stream_ready" (handled in handleSyncMessage below) which
-                        // guarantees at least 2 segments are available before playback starts.
+
+                        // Bug 30 fix: re-send web URL if setWebUrl() was called before
+                        // the relay connection was established. Without this, the client
+                        // would see "Waiting for host to select a video" indefinitely.
+                        val webUrl = pendingWebUrl
+                        if (isHost && webUrl != null) {
+                            delay(300) // brief settle time for the connection
+                            sendMessage(gson.toJson(SyncMessage(
+                                type = "stream_reset", streamEpoch = pendingWebEpoch)))
+                            sendMessage(gson.toJson(SyncMessage(
+                                type = "web_url", url = webUrl, streamEpoch = pendingWebEpoch)))
+                            Log.d("SyncVM", "Re-sent web_url after connect: $webUrl")
+                        }
                     }
                 }
                 override fun onSyncMessage(json: String) = handleSyncMessage(json, baseUrl, roomId)
@@ -176,6 +191,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     _streamEpoch.value = epoch
                     _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, epoch)
                 }
+                // Bug 28 fix: relay sends peer_left when the other side disconnects
+                "peer_left" -> viewModelScope.launch {
+                    val who = if (msg.action == "host") "The host ended the stream" else "Your partner disconnected"
+                    _hostLeft.value = who
+                    _connectionStatus.value = who
+                }
             }
         } catch (e: Exception) {
             Log.e("SyncVM", "Bad sync message: $json — ${e.message}")
@@ -202,6 +223,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (_isHost.value) {
             val epoch = System.currentTimeMillis()
             _streamEpoch.value = epoch
+            // Bug 30 fix: store URL so onConnected() can re-send it if relay
+            // isn't connected yet when this is called.
+            pendingWebUrl = url
+            pendingWebEpoch = epoch
             sendMessage(gson.toJson(SyncMessage(type = "stream_reset", streamEpoch = epoch)))
             sendMessage(gson.toJson(SyncMessage(type = "web_url", url = url, streamEpoch = epoch)))
         }

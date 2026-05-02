@@ -35,11 +35,24 @@ class RelayClient(
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private val client = OkHttpClient.Builder()
+    // WebSocket client: readTimeout=0 (infinite) is REQUIRED so the connection
+    // stays open between messages without the OS closing it.
+    private val wsClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .build()
+
+    // Bug 31 fix: separate client for HTTP segment uploads with a proper read
+    // timeout. The WebSocket client uses readTimeout=0 (infinite), which is
+    // correct for WebSockets but dangerous for HTTP uploads — a stalled server
+    // response would hang the upload coroutine forever, blocking the entire
+    // segment pipeline.
+    private val uploadClient = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
     private var webSocket: WebSocket? = null
@@ -63,7 +76,7 @@ class RelayClient(
             }
             .build()
 
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+        webSocket = wsClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 connected = true
                 reconnectAttempt = 0
@@ -131,7 +144,7 @@ class RelayClient(
         var lastErr: Exception? = null
         repeat(4) { attempt ->
             try {
-                client.newCall(request).execute().use { response ->
+                uploadClient.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
                         Log.d("RelayClient", "Uploaded $filename (${data.size} bytes)")
                         return

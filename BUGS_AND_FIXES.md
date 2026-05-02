@@ -404,3 +404,90 @@ before the buffer pause), it still reports `isPlaying = true` in the pong.
 The client can then start playing as soon as its buffer is ready, and will send
 `"buffering stop"` when it reaches `STATE_READY`, which triggers the host to
 resume in the normal way.
+
+---
+
+## Session 3 — Race Conditions, Disconnect Handling, Dropped Messages (Bugs 26–33)
+
+### Bug 26 🔴 — relay/main.go: reserve() bypass race — two goroutines can claim the same role
+**File:** `relay-server/main.go`  
+**Symptom:** Two connections can both become host (or both become client) for the same room, causing one to silently shadow the other and relay messages to the wrong target.  
+**Root cause:** The original code fell through when `reserve()` returned false *due to a pending upgrade* (i.e., `pendingHost/pendingClient = true` but `room.host == nil`). It only rejected when the live `conn` pointer was non-nil. A second goroutine racing past the check found `conn == nil`, skipped the 409 return, upgraded, and called `commit()`, overwriting the first goroutine's slot.  
+**Fix:** Simplified to always return 409 if `reserve()` fails, for any reason (occupied or pending):
+```go
+if !room.reserve(role) {
+    http.Error(w, "role already taken", http.StatusConflict)
+    return
+}
+```
+
+---
+
+### Bug 27 🟡 — relay/main.go: double-assignment of room.host/client after commit()
+**File:** `relay-server/main.go`  
+**Symptom:** No visible bug, but confusing code path and unnecessary mutex contention.  
+**Root cause:** After calling `room.commit(role, conn)` (which already sets `room.host/client` and clears the pending flag under a write lock), there was an extra `room.mu.Lock()` block that set `room.host` or `room.client` again.  
+**Fix:** Removed the redundant second lock+assign block. `commit()` is now the single place that commits a connection into the room.
+
+---
+
+### Bug 28 🟠 — relay/main.go + Android: host disconnect never notifies client → infinite buffering
+**Files:** `relay-server/main.go`, `app/…/viewmodel/SyncViewModel.kt`, `app/…/ui/screens/RoomScreen.kt`  
+**Symptom:** When the host closes the app or loses connection, the client's video freezes with a buffering spinner and shows "Reconnecting…" indefinitely — the client has no way to know the stream is over.  
+**Root cause:** When the host's read loop broke, the relay only set `room.host = nil` and returned. The client kept sending pings and waiting for responses.  
+**Fix (relay):** After cleaning up the leaving peer's reference, the relay now looks up the other side's connection and sends a `{"type":"peer_left","action":"host"}` (or `"client"`) message, then the OS closes the stale connection naturally.  
+**Fix (Android — SyncViewModel):** Added a handler for `"peer_left"` that sets `_hostLeft` to a human-readable message string.  
+**Fix (Android — RoomScreen):** Client view now checks `hostLeft != null` first and renders a "Stream ended" screen instead of the buffering spinner.
+
+---
+
+### Bug 29 🔴 — RoomScreen.kt: LaunchedEffect fires with empty relayUrl before DataStore loads
+**File:** `app/…/ui/screens/RoomScreen.kt`  
+**Symptom:** On slow devices or cold-start, `initRoom()` is called twice: first with `relayUrl=""` (which creates a RelayClient pointing at nothing), then with the real URL once DataStore emits it. The failed first connection increments `disconnectCount`, potentially triggering the "Waking server…" screen before any real connection attempt has been made.  
+**Root cause:** `collectAsState(initial = "")` causes `relayUrl` to be `""` on the first composition. `LaunchedEffect(roomId, relayUrl, relayToken)` fires immediately with that empty value, calling `initRoom("", …, "", "")`.  
+**Fix:** Changed to `collectAsState(initial = null)` and added a guard:
+```kotlin
+LaunchedEffect(roomId, relayUrl, relayToken) {
+    if (relayUrl == null || relayToken == null) return@LaunchedEffect
+    viewModel.initRoom(roomId, isHost, relayUrl!!, relayToken!!)
+}
+```
+The effect now waits until DataStore has emitted the persisted values before initialising the relay connection.
+
+---
+
+### Bug 30 🟠 — SyncViewModel.kt: web URL silently dropped if relay not yet connected
+**Files:** `app/…/viewmodel/SyncViewModel.kt`, `app/…/ui/screens/RoomScreen.kt`  
+**Symptom:** Host navigates to a room via "Host a Web Video". The relay WebSocket handshake hasn't completed yet when `setWebUrl()` is called. `sendSync()` checks `if (connected) …` and drops both the `stream_reset` and `web_url` messages. Client shows "Waiting for host to select a video" indefinitely.  
+**Root cause:** `setWebUrl()` sent the messages immediately without checking connection state.  
+**Fix:** `setWebUrl()` now stores the URL and epoch in `pendingWebUrl`/`pendingWebEpoch`. The `onConnected()` callback, after verifying it's the host and `pendingWebUrl != null`, waits 300 ms for the connection to stabilise and re-sends both `stream_reset` and `web_url` messages.
+
+---
+
+### Bug 31 🟡 — RelayClient.kt: uploads share the WebSocket OkHttpClient (readTimeout=0)
+**File:** `app/…/relay/RelayClient.kt`  
+**Symptom:** A stalled segment upload (server slow, no response) hangs the upload coroutine forever because there is no read timeout. This blocks the entire upload pipeline — no further segments reach the relay and the client's stream stalls permanently.  
+**Root cause:** `uploadSegment()` used the same `OkHttpClient` as the WebSocket, which requires `readTimeout(0)` (infinite) to prevent the OS from closing an idle connection. That zero timeout also applied to HTTP upload responses.  
+**Fix:** Added a separate `uploadClient` with `readTimeout(60s)` / `writeTimeout(120s)`. The WebSocket client (`wsClient`) keeps `readTimeout(0)`. The upload client is used exclusively in `uploadSegment()`.
+
+---
+
+### Bug 32 🔵 — TestViewModel.kt: segCount closure race → clientHlsUri never set
+**File:** `app/…/viewmodel/TestViewModel.kt`  
+**Symptom:** In the test lab, on a fast device or with a small video file, multiple HLS segments may be produced in quick succession. All of them find `segCount > 2` by the time the main thread processes the `viewModelScope.launch` lambda, so `if (segCount == 2)` is never true — `clientHlsUri` is never set and the client panel shows a black screen forever.  
+**Root cause:** `segCount++` runs on the `HlsSegmenter` background thread. `viewModelScope.launch` posts asynchronously to the main thread. If three segments are produced before the main thread runs any of the coroutines, all three launches see `segCount = 3` and the `== 2` check is missed.  
+**Fix:** Capture the count in a local val before launching:
+```kotlin
+val capturedCount = segCount
+viewModelScope.launch {
+    if (capturedCount == 2) { … }
+}
+```
+
+---
+
+### Bug 33 🔵 — TestViewModel.kt: relay.start() without relay.stop() on video re-pick → BindException
+**File:** `app/…/viewmodel/TestViewModel.kt`  
+**Symptom:** If the user taps the video picker a second time in the test lab while segmenting is already running, `startSegmenting()` calls `relay.start()` while NanoHTTPD is still bound to port 9191, causing a `BindException` crash.  
+**Root cause:** `startSegmenting()` called `relay.start()` unconditionally without first calling `relay.stop()`.  
+**Fix:** Added `relay.stop()` immediately before `relay.start()` in `startSegmenting()`, matching the pattern used in `stopTest()`.

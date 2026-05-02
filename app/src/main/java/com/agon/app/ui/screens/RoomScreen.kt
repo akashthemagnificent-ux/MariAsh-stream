@@ -37,8 +37,14 @@ fun RoomScreen(
     viewModel: SyncViewModel = viewModel()
 ) {
     val context = LocalContext.current
-    val relayUrl by AppPreferences.relayUrl(context).collectAsState(initial = "")
-    val relayToken by AppPreferences.relayToken(context).collectAsState(initial = "")
+
+    // Bug 29 fix: use initial=null so we can tell when DataStore hasn't emitted
+    // yet. With initial="" the LaunchedEffect fires immediately with an empty
+    // relay URL, causing initRoom() to create a RelayClient that points at
+    // nothing, fails, increments disconnectCount, and can trigger the
+    // "waking server" screen before the real URL is even loaded.
+    val relayUrl by AppPreferences.relayUrl(context).collectAsState(initial = null)
+    val relayToken by AppPreferences.relayToken(context).collectAsState(initial = null)
 
     val isConnected by viewModel.isConnected.collectAsState()
     val connectionStatus by viewModel.connectionStatus.collectAsState()
@@ -48,6 +54,7 @@ fun RoomScreen(
     val videoUri by viewModel.videoUri.collectAsState()
     val isSegmenting by viewModel.isSegmenting.collectAsState()
     val segmentsUploaded by viewModel.segmentsUploaded.collectAsState()
+    val hostLeft by viewModel.hostLeft.collectAsState()
 
     var isPipMode by remember { mutableStateOf(false) }
     val activity = context as? ComponentActivity
@@ -61,8 +68,12 @@ fun RoomScreen(
         onDispose { activity?.removeOnPictureInPictureModeChangedListener(observer) }
     }
 
+    // Only initialize once both relayUrl and relayToken are loaded from DataStore.
+    // Using null as the initial sentinel means this effect never fires with an
+    // empty URL on the first composition — it waits for the real persisted value.
     LaunchedEffect(roomId, relayUrl, relayToken) {
-        viewModel.initRoom(roomId, isHost, relayUrl, relayToken)
+        if (relayUrl == null || relayToken == null) return@LaunchedEffect
+        viewModel.initRoom(roomId, isHost, relayUrl!!, relayToken!!)
     }
 
     LaunchedEffect(webUrl) {
@@ -198,6 +209,17 @@ fun RoomScreen(
             } else {
                 // ── Client view ────────────────────────────────────────
                 when {
+                    // Bug 28 fix: show "host left" screen instead of infinite spinner
+                    hostLeft != null -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("Stream ended", style = MaterialTheme.typography.titleLarge)
+                                Spacer(Modifier.height(8.dp))
+                                Text(hostLeft!!, style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
                     !isConnected && isWakingServer -> {
                         WakingServerScreen(elapsedSeconds = wakingElapsedSeconds)
                     }

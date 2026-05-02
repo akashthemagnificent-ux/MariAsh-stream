@@ -123,6 +123,9 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
             it.deleteRecursively(); it.mkdirs()
         }
 
+        // Bug 33 fix: stop the relay before restarting it, so NanoHTTPD doesn't
+        // throw a BindException when a second video is picked while already running.
+        relay.stop()
         relay.start(_currentProfile.value)
 
         var segCount = 0
@@ -132,10 +135,15 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
                 val data = file.readBytes()
                 relay.addSegment(name, data)
                 segCount++
+                // Bug 32 fix: capture the current count in a local val BEFORE
+                // launching the coroutine. The HlsSegmenter thread continues
+                // immediately, so by the time the main thread runs the lambda
+                // segCount may already be 3, 4, … and if(segCount == 2) would
+                // never be true → clientHlsUri never set → black client panel.
+                val capturedCount = segCount
                 viewModelScope.launch {
-                    _testState.value = TestState.Segmenting(segCount)
-                    // 2 segments = 8 seconds buffered → client can start loading
-                    if (segCount == 2) {
+                    _testState.value = TestState.Segmenting(capturedCount)
+                    if (capturedCount == 2) {
                         _clientHlsUri.value = Uri.parse(relay.hlsPlaylistUrl)
                         _testState.value = TestState.Ready
                     }
@@ -175,12 +183,6 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val msg = try { gson.fromJson(json, SyncMessage::class.java) } catch (_: Exception) { return@launch }
             when (msg.type) {
-                "ping" -> {
-                    // Client receives ping from host, echoes pong back through relay
-                    val pong = SyncMessage("pong", position = _clientPositionMs.value,
-                        timestamp = msg.timestamp, isPlaying = true)
-                    relay.sendSyncFromClient(gson.toJson(pong))
-                }
                 // Bug 23 fix: RTT was measured in routeToHost("pong") which only fires
                 // when the HOST sends a ping. But in normal flow, the CLIENT sends pings
                 // and the HOST replies with pongs that travel host→client through THIS
@@ -202,8 +204,6 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val msg = try { gson.fromJson(json, SyncMessage::class.java) } catch (_: Exception) { return@launch }
             when (msg.type) {
-                // "pong" from client→host path only arrives when the host sent a ping,
-                // which doesn't happen in normal flow. RTT is measured in routeToClient.
                 "buffering" -> _clientPartnerBuffering.value = (msg.action == "start")
                 else -> _hostSyncCmd.emit(msg)
             }
