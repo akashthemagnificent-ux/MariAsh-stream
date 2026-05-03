@@ -893,20 +893,3 @@ errors and completion events appear in the in-app Logs screen.
 2. `onPlaylistReady` has fired and updated relay playlist.
 
 Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishedClientHlsUri` guards.
-
-## Bug 45 🔴 — Malformed relay URL in Settings (`33https://...`) causes silent stream pipeline failures
-
-**Symptom:** Host/client show repeated relay failures and black-screen behavior with logs such as:
-- `Invalid relay URL '33https://...'`
-- `sendSync dropped (not connected)`
-- `Segment upload failed ... Expected URL scheme 'http' or 'https'`
-
-Even after picking a local video, host still segments locally and tries uploads, producing cascading errors.
-
-**Root cause:** Relay URL settings may contain accidental leading garbage (e.g., `33https://...`).
-`RelayClient` correctly rejects it, but stream start still proceeds far enough to trigger repeated failed uploads and confusing downstream behavior.
-
-**Fix:** In `SyncViewModel`:
-1. Normalize user-entered relay URL by trimming and stripping any prefix before the first `http://` or `https://`.
-2. Validate with `toHttpUrlOrNull()` and require scheme `http`/`https`.
-3. If invalid, set connection status to "Invalid relay URL — open Settings", skip relay initialization, and block `setVideoFile` stream startup.

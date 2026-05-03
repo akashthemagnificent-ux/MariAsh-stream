@@ -107,13 +107,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var hasSentStreamReady: Boolean = false
     private var playlistUploadedForEpoch: Long = 0L
 
-    private fun normalizeRelayUrl(raw: String): String {
-        val trimmed = raw.trim()
-        val httpIndex = trimmed.indexOf("http://").takeIf { it >= 0 }
-            ?: trimmed.indexOf("https://").takeIf { it >= 0 }
-        return if (httpIndex != null) trimmed.substring(httpIndex).trim() else trimmed
-    }
-
     private fun maybeSendStreamReady() {
         if (_isHost.value && !hasSentStreamReady && playlistUploadedForEpoch == _streamEpoch.value && _segmentsUploaded.value >= 2) {
             hasSentStreamReady = true
@@ -297,11 +290,6 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             val epoch = System.currentTimeMillis()
             _streamEpoch.value = epoch
             hasSentStreamReady = false
-            if (relayClient == null) {
-                AppLogger.e(TAG, "setVideoFile blocked: relay not configured/connected")
-                _connectionStatus.value = "Invalid relay URL — open Settings"
-                return
-            }
             sendMessage(gson.toJson(SyncMessage(type = "stream_reset", streamEpoch = epoch)))
             startSegmenting(uri)
         }
