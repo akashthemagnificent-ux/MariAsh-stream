@@ -880,3 +880,16 @@ errors and completion events appear in the in-app Logs screen.
 **Files changed:**
 - `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`
 - `app/src/main/java/com/agon/app/viewmodel/TestViewModel.kt`
+
+## Bug 44 🔴 — Test Lab publishes client HLS URL before playlist is confirmed ready → ExoPlayer NPE loop / black client pane
+
+**Symptom:** In Test Lab runs (e.g., 2026-05-03 13:04 UTC), the client player starts loading `http://127.0.0.1:9191/hls/playlist.m3u8` as soon as segment #2 arrives, then throws repeated:
+`PlaybackException: ERROR_CODE_IO_UNSPECIFIED — cause: Unexpected NullPointerException`, enters `STATE_IDLE`, and loops re-prepare without ever rendering video.
+
+**Root cause:** `TestViewModel` made client startup depend only on segment count (`capturedCount == 2`) and not on playlist publication readiness. Under jitter/latency, segment insertion can beat playlist propagation, causing early playlist fetches into unstable content and parser NPE failure.
+
+**Fix:** Gate client startup in Test Lab on **both** conditions:
+1. at least 2 segments produced, and
+2. `onPlaylistReady` has fired and updated relay playlist.
+
+Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishedClientHlsUri` guards.

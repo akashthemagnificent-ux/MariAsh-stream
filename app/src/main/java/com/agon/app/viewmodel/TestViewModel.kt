@@ -121,6 +121,18 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
     // Index of the last segment evicted from the relay (so we don't evict twice)
     private var lastEvictedSegIndex = -1
 
+    private var hasPublishedClientHlsUri = false
+    private var playlistReady = false
+
+    private fun maybePublishClientHlsUri() {
+        if (!hasPublishedClientHlsUri && playlistReady && totalSegmentsProduced >= 2) {
+            hasPublishedClientHlsUri = true
+            AppLogger.i("TestVM", "Client HLS ready — playlist uploaded and ${totalSegmentsProduced} segments available")
+            _clientHlsUri.value = Uri.parse(relay.hlsPlaylistUrl)
+            _testState.value = TestState.Ready
+        }
+    }
+
     init {
         relay.onSyncToClient = { json -> viewModelScope.launch { routeToClient(json) } }
         relay.onSyncToHost   = { json -> viewModelScope.launch { routeToHost(json) } }
@@ -145,6 +157,8 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         _clientHlsUri.value = null
         totalSegmentsProduced = 0
         lastEvictedSegIndex = -1
+        hasPublishedClientHlsUri = false
+        playlistReady = false
 
         val outputDir = File(context.cacheDir, "test_hls").also {
             it.deleteRecursively(); it.mkdirs()
@@ -170,15 +184,16 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
                 val capturedCount = totalSegmentsProduced
                 viewModelScope.launch {
                     _testState.value = TestState.Segmenting(capturedCount)
-                    if (capturedCount == 2) {
-                        // Two segments = 8 seconds buffered: enough for ExoPlayer
-                        // to start loading. Show the client player panel.
-                        _clientHlsUri.value = Uri.parse(relay.hlsPlaylistUrl)
-                        _testState.value = TestState.Ready
-                    }
+                    maybePublishClientHlsUri()
                 }
             },
-            onPlaylistReady = { content -> relay.updatePlaylist(content) },
+            onPlaylistReady = { content ->
+                relay.updatePlaylist(content)
+                viewModelScope.launch {
+                    playlistReady = true
+                    maybePublishClientHlsUri()
+                }
+            },
             onProgress = {},
             onError = { err ->
                 AppLogger.e("TestVM", "Segmenter error: $err")
@@ -289,6 +304,8 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
         _driftMs.value = 0L
         totalSegmentsProduced = 0
         lastEvictedSegIndex = -1
+        hasPublishedClientHlsUri = false
+        playlistReady = false
     }
 
     override fun onCleared() {
