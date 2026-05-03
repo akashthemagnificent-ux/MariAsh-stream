@@ -9,6 +9,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,6 +21,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.PictureInPictureModeChangedInfo
 import androidx.core.util.Consumer
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
 import com.agon.app.data.AppPreferences
 import com.agon.app.ui.components.VideoPlayer
 import com.agon.app.viewmodel.SyncViewModel
@@ -34,6 +36,7 @@ fun RoomScreen(
     roomId: String,
     isHost: Boolean,
     webUrl: String? = null,
+    navController: NavController? = null,
     viewModel: SyncViewModel = viewModel()
 ) {
     val context = LocalContext.current
@@ -105,6 +108,10 @@ fun RoomScreen(
                             IconButton(onClick = { launcher.launch(arrayOf("video/*")) }) {
                                 Icon(Icons.Default.FileOpen, contentDescription = "Select Video")
                             }
+                        }
+                        // Logs button — always visible so you can debug both host and client
+                        IconButton(onClick = { navController?.navigate("logs") }) {
+                            Icon(Icons.Default.Terminal, contentDescription = "View Logs")
                         }
                     }
                 )
@@ -209,7 +216,10 @@ fun RoomScreen(
             } else {
                 // ── Client view ────────────────────────────────────────
                 when {
-                    // Bug 28 fix: show "host left" screen instead of infinite spinner
+                    // Bug 28 fix: show "host left" screen instead of infinite spinner.
+                    // Bug 41 fix: this only appears after the 8-second grace period
+                    // expires — transient disconnects (e.g. host opens file picker)
+                    // are absorbed and the client resumes automatically on reconnect.
                     hostLeft != null -> {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {

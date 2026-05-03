@@ -33,6 +33,7 @@ import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.agon.app.debug.AppLogger
 import com.agon.app.viewmodel.SyncMessage
 import com.agon.app.viewmodel.SyncViewModel
 import com.google.gson.Gson
@@ -42,6 +43,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+
+private const val TAG = "VideoPlayer"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VideoPlayer — ExoPlayer composable with full sync engine built in
@@ -138,6 +141,7 @@ fun VideoPlayer(
         }
 
         LaunchedEffect(uri) {
+            AppLogger.i(TAG, "Loading URI: $uri isHost=$isHost")
             exoPlayer.setMediaItem(MediaItem.fromUri(uri))
             exoPlayer.prepare()
             // Host plays immediately; client starts PAUSED and waits for the first
@@ -152,8 +156,10 @@ fun VideoPlayer(
             if (isHost) {
                 if (partnerIsBuffering) {
                     wasPlayingBeforeBuffer = exoPlayer.isPlaying
+                    AppLogger.w(TAG, "Partner buffering — host paused (wasPlaying=$wasPlayingBeforeBuffer)")
                     exoPlayer.pause()
                 } else if (wasPlayingBeforeBuffer) {
+                    AppLogger.i(TAG, "Partner buffering stopped — host resuming")
                     exoPlayer.play()
                 }
             }
@@ -172,6 +178,7 @@ fun VideoPlayer(
         DisposableEffect(Unit) {
             val listener = object : Player.Listener {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    AppLogger.d(TAG, "onIsPlayingChanged: isPlaying=$isPlaying isHost=$isHost handlingSync=$isHandlingSync")
                     if (!isHandlingSync && isHost && !partnerIsBuffering) {
                         val msg = SyncMessage("state", if (isPlaying) "play" else "pause",
                             exoPlayer.currentPosition)
@@ -183,12 +190,21 @@ fun VideoPlayer(
                     oldPos: Player.PositionInfo, newPos: Player.PositionInfo, reason: Int
                 ) {
                     if (!isHandlingSync && isHost && reason == Player.DISCONTINUITY_REASON_SEEK) {
+                        AppLogger.d(TAG, "Host seek: ${oldPos.positionMs}→${newPos.positionMs}ms")
                         val msg = SyncMessage("sync", "seek", exoPlayer.currentPosition)
                         onSendSync(gson.toJson(msg))
                     }
                 }
 
                 override fun onPlaybackStateChanged(state: Int) {
+                    val stateName = when (state) {
+                        Player.STATE_IDLE -> "IDLE"
+                        Player.STATE_BUFFERING -> "BUFFERING"
+                        Player.STATE_READY -> "READY"
+                        Player.STATE_ENDED -> "ENDED"
+                        else -> "UNKNOWN($state)"
+                    }
+                    AppLogger.d(TAG, "onPlaybackStateChanged: $stateName pos=${exoPlayer.currentPosition}ms hasEverStarted=$hasEverStartedPlaying")
                     if (!isHost) {
                         // Only report buffering events after the client has been told to play
                         // at least once. Before the first play command, STATE_BUFFERING is
@@ -200,6 +216,7 @@ fun VideoPlayer(
                             Player.STATE_READY -> "stop"
                             else -> return
                         }
+                        AppLogger.i(TAG, "Client buffering $action — notifying host")
                         onSendSync(gson.toJson(SyncMessage("buffering", action, exoPlayer.currentPosition)))
                     }
                 }
@@ -210,6 +227,7 @@ fun VideoPlayer(
                 // URL requires login cookies, or the URL is a webpage not a video.
                 override fun onPlayerError(error: PlaybackException) {
                     val cause = error.cause?.message ?: error.message ?: "Unknown error"
+                    AppLogger.e(TAG, "PlaybackException: ${error.errorCodeName} — cause: $cause")
                     playerError = when {
                         cause.contains("403") || cause.contains("Forbidden", ignoreCase = true) ->
                             "Video URL blocked (HTTP 403). TikTok/YouTube/Netflix links don't work — use a direct .mp4 or .m3u8 URL."
@@ -230,6 +248,7 @@ fun VideoPlayer(
             }
             exoPlayer.addListener(listener)
             onDispose {
+                AppLogger.d(TAG, "Disposing ExoPlayer for uri=$uri")
                 exoPlayer.removeListener(listener)
                 exoPlayer.release()
             }
@@ -284,23 +303,30 @@ fun VideoPlayer(
                                 val estimatedHostPos = msg.position + if (msg.isPlaying) oneWay else 0L
                                 val drift = abs(exoPlayer.currentPosition - estimatedHostPos)
 
+                                AppLogger.d(TAG, "PONG: hostPos=${msg.position}ms estimated=${estimatedHostPos}ms " +
+                                    "clientPos=${exoPlayer.currentPosition}ms drift=${drift}ms " +
+                                    "rtt=${rtt}ms hostPlaying=${msg.isPlaying} clientPlaying=${exoPlayer.isPlaying} " +
+                                    "hasSeeked=$hasSeekedForStartup hasStarted=$hasEverStartedPlaying")
+
                                 // Bug 36 fix: guard against seek storm during startup.
                                 // See hasSeekedForStartup declaration above for full explanation.
                                 when {
                                     drift > 3000 && exoPlayer.isPlaying -> {
                                         // Mid-playback: seek immediately to correct real desync
+                                        AppLogger.w(TAG, "Mid-playback seek: drift=${drift}ms → seekTo $estimatedHostPos")
                                         exoPlayer.seekTo(estimatedHostPos)
                                     }
                                     drift > 3000 && !hasSeekedForStartup && msg.isPlaying -> {
                                         // Startup: seek ONCE to align with host, then let
                                         // ExoPlayer buffer undisturbed until isPlaying=true.
+                                        AppLogger.i(TAG, "Startup seek: drift=${drift}ms → seekTo $estimatedHostPos")
                                         exoPlayer.seekTo(estimatedHostPos)
                                         hasSeekedForStartup = true
                                     }
                                     drift > 300 && msg.isPlaying -> {
-                                        exoPlayer.setPlaybackSpeed(
-                                            if (exoPlayer.currentPosition < estimatedHostPos) 1.05f else 0.95f
-                                        )
+                                        val speed = if (exoPlayer.currentPosition < estimatedHostPos) 1.05f else 0.95f
+                                        AppLogger.d(TAG, "Speed nudge: drift=${drift}ms → speed=$speed")
+                                        exoPlayer.setPlaybackSpeed(speed)
                                     }
                                     else -> exoPlayer.setPlaybackSpeed(1.0f)
                                 }
@@ -309,25 +335,39 @@ fun VideoPlayer(
                                 // correct position (Bug 17 fix). Setting hasEverStartedPlaying
                                 // here enables mid-playback buffering reports.
                                 if (msg.isPlaying && !exoPlayer.isPlaying) {
+                                    AppLogger.i(TAG, "First play command from host — starting client playback")
                                     hasEverStartedPlaying = true
                                     exoPlayer.play()
                                 }
-                                if (!msg.isPlaying && exoPlayer.isPlaying) exoPlayer.pause()
+                                if (!msg.isPlaying && exoPlayer.isPlaying) {
+                                    AppLogger.i(TAG, "Host paused — pausing client")
+                                    exoPlayer.pause()
+                                }
                             }
                         }
                         "state", "sync" -> {
                             if (!isHost) {
                                 when (msg.action) {
                                     "play" -> {
+                                        AppLogger.i(TAG, "CMD play pos=${msg.position}ms")
                                         hasEverStartedPlaying = true
                                         hasSeekedForStartup = true
                                         exoPlayer.seekTo(msg.position)
                                         exoPlayer.play()
                                     }
-                                    "pause" -> { exoPlayer.pause(); exoPlayer.seekTo(msg.position) }
-                                    "seek" -> exoPlayer.seekTo(msg.position)
-                                    "position" -> if (abs(exoPlayer.currentPosition - msg.position) > 2000)
+                                    "pause" -> {
+                                        AppLogger.i(TAG, "CMD pause pos=${msg.position}ms")
+                                        exoPlayer.pause()
                                         exoPlayer.seekTo(msg.position)
+                                    }
+                                    "seek" -> {
+                                        AppLogger.i(TAG, "CMD seek pos=${msg.position}ms")
+                                        exoPlayer.seekTo(msg.position)
+                                    }
+                                    "position" -> if (abs(exoPlayer.currentPosition - msg.position) > 2000) {
+                                        AppLogger.i(TAG, "CMD position correction pos=${msg.position}ms (drift=${abs(exoPlayer.currentPosition - msg.position)}ms)")
+                                        exoPlayer.seekTo(msg.position)
+                                    }
                                 }
                             }
                         }
@@ -343,6 +383,7 @@ fun VideoPlayer(
                                     val candidateGroup = availableTracks?.groups
                                         ?.firstOrNull { it.type == targetType && targetIndex < it.length }
                                     if (candidateGroup != null) {
+                                        AppLogger.i(TAG, "Track switch: type=${msg.action} index=$targetIndex")
                                         exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
                                             .buildUpon()
                                             .setOverrideForType(
@@ -468,17 +509,14 @@ fun VideoPlayer(
     viewModel: SyncViewModel,
     modifier: Modifier = Modifier
 ) {
-    val isHost by viewModel.isHost.collectAsState()
     VideoPlayer(
         uri = uri,
-        isHost = isHost,
+        isHost = viewModel.isHost.collectAsState().value,
         syncCommands = viewModel.syncCommand,
         reactionCommands = viewModel.reactionCommand,
         partnerBuffering = viewModel.partnerBuffering,
         latency = viewModel.latency,
         onSendSync = { viewModel.sendMessage(it) },
-        onPositionUpdate = null,
-        showControls = isHost,
         modifier = modifier
     )
 }

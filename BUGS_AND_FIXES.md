@@ -760,3 +760,33 @@ actions into Node.js 24, eliminating the warning and future-proofing the build
 before the deadline. After June 2nd when Node 24 becomes the runner default, the
 env var can be removed (it will be a no-op by then).
 
+
+---
+
+## Bug 41 — Client permanently stuck on "Stream ended" when host opens file picker
+
+**Symptom:** When the host taps the file picker button (or any action that sends
+the Activity to the background), the relay server immediately sends a `peer_left`
+event to the client. The client shows "Stream ended" / "The host ended the stream"
+permanently — even after the host returns from the file picker and reconnects.
+There is no way for the client to recover without leaving and rejoining the room.
+
+**Root cause:** Android sends the Activity to the background when a system picker
+opens. OkHttp detects the TCP socket has gone idle and closes the WebSocket.
+The relay server notices the host's WebSocket closed and immediately broadcasts
+`peer_left { action: "host" }` to all clients. `SyncViewModel.handleSyncMessage`
+previously set `_hostLeft` immediately on receiving `peer_left`, rendering the
+"Stream ended" screen with no recovery path.
+
+**Fix:** Added an 8-second grace period (`peerLeftGraceJob`) in `SyncViewModel`.
+- `peer_left` now launches a coroutine that waits 8 seconds before setting
+  `_hostLeft`. This gives the host's OkHttp reconnect (exponential backoff,
+  first attempt ≈2s) time to succeed.
+- On `onConnected()`, `stream_reset`, and `stream_ready`, the grace job is
+  cancelled and `_hostLeft` is cleared — so the client resumes seamlessly if
+  the host comes back within the window.
+- If the host does NOT reconnect within 8 seconds (genuine disconnect), the
+  "Stream ended" screen appears exactly as before.
+
+**Files changed:**
+- `app/src/main/java/com/agon/app/viewmodel/SyncViewModel.kt`

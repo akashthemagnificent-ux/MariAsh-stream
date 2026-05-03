@@ -1,6 +1,6 @@
 package com.agon.app.relay
 
-import android.util.Log
+import com.agon.app.debug.AppLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,6 +19,8 @@ import java.nio.charset.StandardCharsets
 import kotlin.math.min
 import kotlin.random.Random
 import java.util.concurrent.TimeUnit
+
+private const val TAG = "RelayClient"
 
 interface RelayListener {
     fun onConnected()
@@ -71,6 +73,7 @@ class RelayClient(
         // → crashes the app. Guard here and fire onDisconnected with a clear
         // message so RoomScreen can show "configure relay" instead of crashing.
         if (relayBaseUrl.isBlank()) {
+            AppLogger.w(TAG, "connect() called with blank relay URL — aborting")
             listener.onDisconnected("NO_RELAY_URL")
             return
         }
@@ -95,27 +98,30 @@ class RelayClient(
                 }
                 .build()
         } catch (e: IllegalArgumentException) {
-            Log.e("RelayClient", "Invalid relay URL '$relayBaseUrl': ${e.message}")
+            AppLogger.e(TAG, "Invalid relay URL '$relayBaseUrl': ${e.message}")
             listener.onDisconnected("Invalid relay URL — check Settings. (${e.message})")
             return
         }
+
+        AppLogger.i(TAG, "Connecting to room $roomId as $role via ${relayBaseUrl.trimEnd('/')}")
 
         webSocket = wsClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 connected = true
                 reconnectAttempt = 0
-                Log.d("RelayClient", "Connected to room $roomId as $role")
+                AppLogger.i(TAG, "WebSocket connected — room=$roomId role=$role")
                 listener.onConnected()
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
+                AppLogger.d(TAG, "MSG ← $text")
                 listener.onSyncMessage(text)
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 connected = false
-                Log.e("RelayClient", "WebSocket failure: ${t.message}")
                 val code = response?.code ?: -1
+                AppLogger.e(TAG, "WebSocket failure: ${t.message} (HTTP $code)")
                 if (code == 401 || code == 403) {
                     listener.onDisconnected("Unauthorized (HTTP $code). Check Relay Token.")
                     destroyed = true
@@ -127,6 +133,7 @@ class RelayClient(
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 connected = false
+                AppLogger.w(TAG, "WebSocket closed: code=$code reason='$reason'")
                 listener.onDisconnected(reason)
                 scheduleReconnect()
             }
@@ -141,14 +148,19 @@ class RelayClient(
             val baseDelayMs = (1 shl exp) * 1000L
             val jitter = Random.nextLong(250L, 1250L)
             val waitMs = baseDelayMs + jitter
-            Log.w("RelayClient", "Reconnecting in ${waitMs}ms (attempt $reconnectAttempt)")
+            AppLogger.w(TAG, "Reconnect attempt $reconnectAttempt in ${waitMs}ms")
             delay(waitMs)
             connect()
         }
     }
 
     fun sendSync(json: String) {
-        if (connected) webSocket?.send(json)
+        if (connected) {
+            AppLogger.d(TAG, "MSG → $json")
+            webSocket?.send(json)
+        } else {
+            AppLogger.w(TAG, "sendSync dropped (not connected): $json")
+        }
     }
 
     suspend fun uploadSegment(filename: String, data: ByteArray) {
@@ -170,21 +182,21 @@ class RelayClient(
             try {
                 uploadClient.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
-                        Log.d("RelayClient", "Uploaded $filename (${data.size} bytes)")
+                        AppLogger.d(TAG, "Uploaded $filename (${data.size} bytes)")
                         return
                     }
                     if (response.code == 429 || response.code in 500..599) {
                         throw IOException("Retryable upload error ${response.code} for $filename")
                     }
                     val body = response.body?.string().orEmpty()
-                    Log.e("RelayClient", "Upload failed: ${response.code} for $filename $body")
+                    AppLogger.e(TAG, "Upload failed: ${response.code} for $filename — $body")
                     throw IOException("Non-retryable upload error ${response.code} for $filename")
                 }
             } catch (e: Exception) {
                 lastErr = e
                 if (attempt == 3) return@repeat
                 val retryDelay = (attempt + 1) * 800L
-                Log.w("RelayClient", "Upload retry ${attempt + 1} for $filename in ${retryDelay}ms: ${e.message}")
+                AppLogger.w(TAG, "Upload retry ${attempt + 1} for $filename in ${retryDelay}ms: ${e.message}")
                 delay(retryDelay)
             }
         }
@@ -194,6 +206,7 @@ class RelayClient(
     fun getHlsUrl(): String = "${relayBaseUrl.trimEnd('/')}/hls/$roomId/playlist.m3u8"
 
     fun disconnect() {
+        AppLogger.i(TAG, "disconnect() called — destroying relay for room $roomId")
         destroyed = true
         connected = false
         webSocket?.close(1000, "Disconnected")

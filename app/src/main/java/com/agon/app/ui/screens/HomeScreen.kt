@@ -48,6 +48,9 @@ fun HomeScreen(navController: NavController) {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { navController.navigate("logs") }) {
+                        Icon(Icons.Default.Terminal, contentDescription = "View Logs")
+                    }
                     IconButton(onClick = { navController.navigate("settings") }) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }

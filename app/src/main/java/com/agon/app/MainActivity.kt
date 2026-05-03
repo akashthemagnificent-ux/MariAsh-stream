@@ -18,6 +18,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.agon.app.ui.screens.HomeScreen
 import com.agon.app.ui.screens.LocalTestScreen
+import com.agon.app.ui.screens.LogScreen
 import com.agon.app.ui.screens.RoomScreen
 import com.agon.app.ui.screens.SettingsScreen
 import com.agon.app.ui.theme.AgonAppTheme
@@ -57,6 +58,7 @@ fun MainApp() {
             composable("home") { HomeScreen(navController) }
             composable("settings") { SettingsScreen(navController) }
             composable("local_test") { LocalTestScreen() }
+            composable("logs") { LogScreen(navController) }
             composable(
                 "room/{roomId}/{isHost}?webUrl={webUrl}",
                 arguments = listOf(
@@ -73,7 +75,7 @@ fun MainApp() {
                 val isHost = entry.arguments?.getBoolean("isHost") ?: false
                 val encodedUrl = entry.arguments?.getString("webUrl")
                 val webUrl = encodedUrl?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.toString()) }
-                RoomScreen(roomId, isHost, webUrl)
+                RoomScreen(roomId, isHost, webUrl, navController = navController)
             }
         }
     }

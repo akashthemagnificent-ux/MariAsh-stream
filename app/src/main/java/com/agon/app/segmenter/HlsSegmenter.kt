@@ -6,7 +6,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
-import android.util.Log
+import com.agon.app.debug.AppLogger
 import java.io.File
 import java.nio.ByteBuffer
 import kotlin.math.ceil
@@ -67,11 +67,12 @@ class HlsSegmenter(
         outputDir.deleteRecursively()
         outputDir.mkdirs()
         running = true
+        AppLogger.i(TAG, "segment() start — uri=$uri outputDir=$outputDir")
         workerThread = Thread {
             try {
                 doSegment(uri, outputDir)
             } catch (e: Exception) {
-                Log.e(TAG, "Segmenter error: ${e.message}", e)
+                AppLogger.e(TAG, "Segmenter crashed: ${e.message}")
                 running = false
                 onError(e.message ?: "Unknown segmenter error")
             }
@@ -101,9 +102,12 @@ class HlsSegmenter(
         if (tracks.isEmpty()) {
             extractor.release()
             running = false
+            AppLogger.e(TAG, "No video or audio tracks found in source file")
             onError("No video or audio tracks found in source file")
             return
         }
+
+        AppLogger.i(TAG, "Found ${tracks.size} tracks in source")
 
         val readBuffer = ByteBuffer.allocate(4 * 1024 * 1024)
         val bufferInfo = MediaCodec.BufferInfo()
@@ -138,7 +142,7 @@ class HlsSegmenter(
 
                     onProgress(completedFiles.size)
                     onPlaylistReady(buildPlaylist(completedFiles, completedDurations, isComplete = false))
-                    Log.d(TAG, "Segment ${file.name} ready (${"%.2f".format(dur)}s)")
+                    AppLogger.d(TAG, "Segment ${file.name} ready (${"%.2f".format(dur)}s, total=${completedFiles.size})")
 
                     // Look-ahead throttle: pause the worker thread if the caller
                     // signals we are too far ahead of the consumer (e.g. the host's
@@ -151,7 +155,7 @@ class HlsSegmenter(
                             try { Thread.sleep(200) } catch (_: InterruptedException) { running = false }
                             waited += 200
                             if (waited % 2000 == 0) {
-                                Log.d(TAG, "Segmenter paused (look-ahead window full), waiting…")
+                                AppLogger.d(TAG, "Segmenter paused — look-ahead window full, waited ${waited}ms")
                             }
                         }
                     }
@@ -170,7 +174,7 @@ class HlsSegmenter(
             }
             muxer!!.start()
             segmentStartUs = startUs
-            Log.d(TAG, "Started segment $name at ${"%.2f".format(startUs / 1_000_000.0)}s")
+            AppLogger.d(TAG, "Started segment $name at ${"%.2f".format(startUs / 1_000_000.0)}s")
         }
 
         startNewSegment(0L)
@@ -206,9 +210,10 @@ class HlsSegmenter(
         if (completedFiles.isNotEmpty()) {
             val finalPlaylist = buildPlaylist(completedFiles, completedDurations, isComplete = true)
             onPlaylistReady(finalPlaylist)
-            Log.d(TAG, "Segmenting complete: ${completedFiles.size} segments")
+            AppLogger.i(TAG, "Segmenting complete: ${completedFiles.size} segments")
             if (running) onComplete()
         } else {
+            AppLogger.e(TAG, "No segments produced — source file may be empty or unsupported")
             onError("No segments produced — source file may be empty or unsupported")
         }
 
@@ -241,6 +246,7 @@ class HlsSegmenter(
     }
 
     fun stop() {
+        AppLogger.i(TAG, "stop() called")
         running = false
         workerThread?.interrupt()
     }
