@@ -1,6 +1,6 @@
 package com.agon.app.relay
 
-import android.util.Log
+import com.agon.app.debug.AppLogger
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -129,7 +129,11 @@ private class BandwidthThrottledStream(
 class SimulatedRelay(private val port: Int = 9191) {
 
     private val segments = ConcurrentHashMap<String, ByteArray>()
-    private var playlist: String = ""
+    // Bug 42 fix: @Volatile ensures NanoHTTPD's server thread always sees the
+    // latest value written by the HlsSegmenter worker thread via updatePlaylist().
+    // Without @Volatile, the NanoHTTPD thread can read a stale (empty) playlist
+    // and serve HTTP 503, causing ExoPlayer to NPE when parsing the error body.
+    @Volatile private var playlist: String = ""
 
     @Volatile private var profile: NetworkProfile = NetworkProfiles.INDIA_USA
     @Volatile private var running = false
@@ -235,7 +239,7 @@ class SimulatedRelay(private val port: Int = 9191) {
         _segmentCount.value = 0
         _droppedPackets.value = 0
         httpServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-        Log.d("SimulatedRelay", "Started on port $port — profile: ${profile.label}")
+        AppLogger.d("SimulatedRelay", "Started on port $port — profile: ${profile.label}")
     }
 
     fun stop() {
@@ -243,12 +247,12 @@ class SimulatedRelay(private val port: Int = 9191) {
         httpServer.stop()
         segments.clear()
         playlist = ""
-        Log.d("SimulatedRelay", "Stopped")
+        AppLogger.d("SimulatedRelay", "Stopped")
     }
 
     fun setProfile(newProfile: NetworkProfile) {
         profile = newProfile
-        Log.d("SimulatedRelay", "Profile changed to: ${newProfile.label}")
+        AppLogger.d("SimulatedRelay", "Profile changed to: ${newProfile.label}")
     }
 
     // ── Segment management ────────────────────────────────────────
@@ -256,7 +260,7 @@ class SimulatedRelay(private val port: Int = 9191) {
         segments[name] = data
         _uploadedBytes.value += data.size
         _segmentCount.value = segments.filter { it.key.endsWith(".mp4") }.size
-        Log.d("SimulatedRelay", "Segment stored: $name (${data.size / 1024}KB), total: ${_segmentCount.value}")
+        AppLogger.d("SimulatedRelay", "Segment stored: $name (${data.size / 1024}KB), total: ${_segmentCount.value}")
     }
 
     fun updatePlaylist(content: String) {
@@ -271,7 +275,7 @@ class SimulatedRelay(private val port: Int = 9191) {
         val removed = segments.remove(name)
         if (removed != null) {
             _segmentCount.value = segments.filter { it.key.endsWith(".mp4") }.size
-            Log.d("SimulatedRelay", "Evicted segment: $name, relay now holds ${_segmentCount.value} segments")
+            AppLogger.d("SimulatedRelay", "Evicted segment: $name, relay now holds ${_segmentCount.value} segments")
         }
     }
 
@@ -314,7 +318,7 @@ class SimulatedRelay(private val port: Int = 9191) {
         val dropped = Random.nextInt(100) < profile.packetLossPercent
         if (dropped) {
             _droppedPackets.value++
-            Log.w("SimulatedRelay", "Packet dropped ($direction) — simulating ${profile.packetLossPercent}% loss")
+            AppLogger.w("SimulatedRelay", "Packet dropped ($direction) — simulating ${profile.packetLossPercent}% loss")
         }
         return dropped
     }

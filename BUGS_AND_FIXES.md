@@ -790,3 +790,93 @@ previously set `_hostLeft` immediately on receiving `peer_left`, rendering the
 
 **Files changed:**
 - `app/src/main/java/com/agon/app/viewmodel/SyncViewModel.kt`
+
+
+---
+
+## Bug 42 🔴 — `playlist` field not `@Volatile` in `SimulatedRelay` → stale read → HTTP 503 → ExoPlayer NPE
+
+**Symptom (Test Lab):** Client ExoPlayer immediately throws
+`ERROR_CODE_IO_UNSPECIFIED — cause: Unexpected NullPointerException` ~758 ms after
+loading `http://127.0.0.1:9191/hls/playlist.m3u8`. Occurs reliably on the India→USA
+profile in Test Lab loopback tests.
+
+**Root cause:** `SimulatedRelay.playlist` was a plain (non-`@Volatile`) `String` field.
+The JVM memory model does NOT guarantee that a write on one thread is visible to another
+thread unless a happens-before relationship is established. Two threads race on this field:
+
+- **HlsSegmenter worker thread** writes `playlist` via `updatePlaylist()`, which is called
+  from `onPlaylistReady` (synchronously after `onSegmentReady`).
+- **NanoHTTPD server thread** reads `playlist` inside `servePlaylist()`.
+
+Without `@Volatile`, the NanoHTTPD thread can observe the stale initial value (`""`).
+`servePlaylist()` then returns `HTTP 503 Service Unavailable` with a plain-text body
+`"Playlist not ready yet"`. ExoPlayer's HLS parser attempts to parse this error body as
+an M3U8 playlist and throws a `NullPointerException` while traversing null fields in the
+incomplete parse tree, which is wrapped as `ERROR_CODE_IO_UNSPECIFIED`.
+
+**Fix:** Added `@Volatile` to `SimulatedRelay.playlist`:
+```kotlin
+@Volatile private var playlist: String = ""
+```
+This establishes a happens-before relationship between the writer (worker thread) and the
+reader (NanoHTTPD thread), ensuring the server thread always sees the most recent playlist
+content.
+
+**Also:** Replaced all `Log.*` calls in `SimulatedRelay` with `AppLogger.*` so relay
+activity now appears in the in-app Logs screen for future diagnosis.
+
+**Files changed:**
+- `app/src/main/java/com/agon/app/relay/SimulatedRelay.kt`
+
+---
+
+## Bug 43 🔴 — ExoPlayer enters `STATE_IDLE` after `PlaybackException`; `play()` does nothing → permanent black screen
+
+**Symptom:** After any `PlaybackException` (including the NPE from Bug 42), the client's
+ExoPlayer transitions to `STATE_IDLE`. The next PONG that arrives with `isPlaying=true`
+calls `exoPlayer.play()`. Calling `play()` on an `STATE_IDLE` player is a no-op — ExoPlayer
+does not start loading. The client is permanently stuck on "Video failed to load" regardless
+of how many PONGs arrive.
+
+**Root cause:** ExoPlayer's state machine requires `prepare()` to transition out of
+`STATE_IDLE`. Once in IDLE (whether initial or post-error), calling `play()` alone has no
+effect. The correct recovery sequence is:
+1. `exoPlayer.seekTo(estimatedHostPos)` — sets the pending start position BEFORE preparing
+   so ExoPlayer loads the correct HLS segment (not segment 0).
+2. `exoPlayer.prepare()` — starts the load pipeline and transitions to `STATE_BUFFERING`.
+3. `exoPlayer.play()` — sets `playWhenReady = true`; playback starts when buffering is done.
+
+**Fix:** Added an IDLE-state guard in two call sites in `VideoPlayer.kt`:
+
+1. **Pong handler** (`"pong"` branch, client-side, `msg.isPlaying && !exoPlayer.isPlaying`):
+```kotlin
+if (exoPlayer.playbackState == Player.STATE_IDLE) {
+    AppLogger.w(TAG, "Player in IDLE (post-error) — re-preparing at ${estimatedHostPos}ms")
+    exoPlayer.seekTo(estimatedHostPos)
+    exoPlayer.prepare()
+    hasSeekedForStartup = true
+    playerError = null   // clears the error overlay immediately
+}
+exoPlayer.play()
+```
+
+2. **State/sync "play" command handler** (host-issued explicit play):
+```kotlin
+if (exoPlayer.playbackState == Player.STATE_IDLE) {
+    AppLogger.w(TAG, "CMD play: player in IDLE — re-preparing at ${msg.position}ms")
+    playerError = null
+    exoPlayer.seekTo(msg.position)
+    exoPlayer.prepare()
+} else {
+    exoPlayer.seekTo(msg.position)
+}
+exoPlayer.play()
+```
+
+**Also:** Replaced `Log.*` in `TestViewModel` with `AppLogger.*` so segmenter
+errors and completion events appear in the in-app Logs screen.
+
+**Files changed:**
+- `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`
+- `app/src/main/java/com/agon/app/viewmodel/TestViewModel.kt`

@@ -3,9 +3,9 @@ package com.agon.app.viewmodel
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.agon.app.debug.AppLogger
 import com.agon.app.relay.NetworkProfile
 import com.agon.app.relay.NetworkProfiles
 import com.agon.app.relay.SimulatedRelay
@@ -181,11 +181,11 @@ class TestViewModel(application: Application) : AndroidViewModel(application) {
             onPlaylistReady = { content -> relay.updatePlaylist(content) },
             onProgress = {},
             onError = { err ->
-                Log.e("TestVM", "Segmenter error: $err")
+                AppLogger.e("TestVM", "Segmenter error: $err")
                 viewModelScope.launch { _testState.value = TestState.Error(err) }
             },
             onComplete = {
-                Log.d("TestVM", "Segmenting complete ($totalSegmentsProduced segments)")
+                AppLogger.d("TestVM", "Segmenting complete ($totalSegmentsProduced segments)")
             }
         )
 

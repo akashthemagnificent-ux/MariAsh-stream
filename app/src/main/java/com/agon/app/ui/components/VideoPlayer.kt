@@ -337,6 +337,20 @@ fun VideoPlayer(
                                 if (msg.isPlaying && !exoPlayer.isPlaying) {
                                     AppLogger.i(TAG, "First play command from host — starting client playback")
                                     hasEverStartedPlaying = true
+                                    // Bug 43 fix: after PlaybackException, ExoPlayer enters
+                                    // STATE_IDLE. play() on an IDLE player does nothing — the
+                                    // client is permanently stuck on the error screen.
+                                    // Fix: if IDLE (post-error), seekTo the estimated host
+                                    // position THEN prepare(). seekTo() before prepare() sets
+                                    // the start position so ExoPlayer loads from the right
+                                    // HLS segment instead of restarting from 0.
+                                    if (exoPlayer.playbackState == Player.STATE_IDLE) {
+                                        AppLogger.w(TAG, "Player in IDLE (post-error) — re-preparing at ${estimatedHostPos}ms")
+                                        exoPlayer.seekTo(estimatedHostPos)
+                                        exoPlayer.prepare()
+                                        hasSeekedForStartup = true
+                                        playerError = null
+                                    }
                                     exoPlayer.play()
                                 }
                                 if (!msg.isPlaying && exoPlayer.isPlaying) {
@@ -352,7 +366,17 @@ fun VideoPlayer(
                                         AppLogger.i(TAG, "CMD play pos=${msg.position}ms")
                                         hasEverStartedPlaying = true
                                         hasSeekedForStartup = true
-                                        exoPlayer.seekTo(msg.position)
+                                        // Bug 43 fix: same IDLE guard as in the pong handler —
+                                        // a CMD play after a post-error recovery also needs
+                                        // prepare() before seekTo()/play().
+                                        if (exoPlayer.playbackState == Player.STATE_IDLE) {
+                                            AppLogger.w(TAG, "CMD play: player in IDLE — re-preparing at ${msg.position}ms")
+                                            playerError = null
+                                            exoPlayer.seekTo(msg.position)
+                                            exoPlayer.prepare()
+                                        } else {
+                                            exoPlayer.seekTo(msg.position)
+                                        }
                                         exoPlayer.play()
                                     }
                                     "pause" -> {
