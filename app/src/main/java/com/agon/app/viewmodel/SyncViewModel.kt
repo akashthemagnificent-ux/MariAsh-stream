@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.File
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -103,6 +104,23 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     // sendSync drops messages silently when connected=false).
     private var pendingWebUrl: String? = null
     private var pendingWebEpoch: Long = 0L
+    private var hasSentStreamReady: Boolean = false
+    private var playlistUploadedForEpoch: Long = 0L
+
+    private fun normalizeRelayUrl(raw: String): String {
+        val trimmed = raw.trim()
+        val httpIndex = trimmed.indexOf("http://").takeIf { it >= 0 }
+            ?: trimmed.indexOf("https://").takeIf { it >= 0 }
+        return if (httpIndex != null) trimmed.substring(httpIndex).trim() else trimmed
+    }
+
+    private fun maybeSendStreamReady() {
+        if (_isHost.value && !hasSentStreamReady && playlistUploadedForEpoch == _streamEpoch.value && _segmentsUploaded.value >= 2) {
+            hasSentStreamReady = true
+            AppLogger.i(TAG, "2 segments + playlist uploaded — sending stream_ready (epoch=${_streamEpoch.value})")
+            sendMessage(gson.toJson(SyncMessage(type = "stream_ready", streamEpoch = _streamEpoch.value)))
+        }
+    }
 
     fun initRoom(roomId: String, isHost: Boolean, relayUrl: String = "", relayToken: String = "") {
         AppLogger.i(TAG, "initRoom: room=$roomId isHost=$isHost relayUrl=${relayUrl.ifBlank { "<blank>" }}")
@@ -119,7 +137,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _hostLeft.value = null
         this.relayToken = relayToken.trim()
 
-        val baseUrl = relayUrl.trimEnd('/')
+        val normalizedUrl = normalizeRelayUrl(relayUrl)
+        val parsed = normalizedUrl.toHttpUrlOrNull()
+        if (parsed == null || (parsed.scheme != "http" && parsed.scheme != "https")) {
+            _connectionStatus.value = "Invalid relay URL — open Settings"
+            _isConnected.value = false
+            AppLogger.e(TAG, "Invalid relay URL in settings: '$relayUrl' (normalized='$normalizedUrl')")
+            relayClient = null
+            return
+        }
+
+        val baseUrl = parsed.toString().trimEnd('/')
 
         relayClient = RelayClient(
             relayBaseUrl = baseUrl,
@@ -221,7 +249,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     peerLeftGraceJob = null
                     _hostLeft.value = null
                     _streamEpoch.value = msg.streamEpoch
-                    _proxyUrl.value = buildPlaylistUrl(baseUrl, roomId, msg.streamEpoch)
+                    _proxyUrl.value = null
                     _videoUri.value = null
                 }
                 "stream_ready" -> if (!_isHost.value) viewModelScope.launch {
@@ -268,6 +296,12 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (_isHost.value) {
             val epoch = System.currentTimeMillis()
             _streamEpoch.value = epoch
+            hasSentStreamReady = false
+            if (relayClient == null) {
+                AppLogger.e(TAG, "setVideoFile blocked: relay not configured/connected")
+                _connectionStatus.value = "Invalid relay URL — open Settings"
+                return
+            }
             sendMessage(gson.toJson(SyncMessage(type = "stream_reset", streamEpoch = epoch)))
             startSegmenting(uri)
         }
@@ -279,6 +313,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         if (_isHost.value) {
             val epoch = System.currentTimeMillis()
             _streamEpoch.value = epoch
+            hasSentStreamReady = false
             // Bug 30 fix: store URL so onConnected() can re-send it if relay
             // isn't connected yet when this is called.
             pendingWebUrl = url
@@ -292,6 +327,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         hlsSegmenter?.stop()
         _isSegmenting.value = true
         _segmentsUploaded.value = 0
+        playlistUploadedForEpoch = 0L
         val outputDir = File(context.cacheDir, "hls_${_roomId.value}").also {
             it.deleteRecursively(); it.mkdirs()
         }
@@ -308,10 +344,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         relayClient?.uploadSegment(name, data)
                         _segmentsUploaded.value++
                         AppLogger.d(TAG, "Segment $name uploaded (total=${_segmentsUploaded.value})")
-                        if (_segmentsUploaded.value == 2) {
-                            AppLogger.i(TAG, "2 segments ready — sending stream_ready (epoch=${_streamEpoch.value})")
-                            sendMessage(gson.toJson(SyncMessage(type = "stream_ready", streamEpoch = _streamEpoch.value)))
-                        }
+                        maybeSendStreamReady()
                     } catch (e: Exception) {
                         AppLogger.e(TAG, "Segment upload failed: $name — ${e.message}")
                     }
@@ -322,6 +355,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                     try {
                         val patched = patchPlaylistWithToken(content)
                         relayClient?.uploadSegment("playlist.m3u8", patched.toByteArray())
+                        playlistUploadedForEpoch = _streamEpoch.value
+                        maybeSendStreamReady()
                     }
                     catch (e: Exception) { AppLogger.e(TAG, "Playlist upload failed: ${e.message}") }
                 }

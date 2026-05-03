@@ -880,3 +880,33 @@ errors and completion events appear in the in-app Logs screen.
 **Files changed:**
 - `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`
 - `app/src/main/java/com/agon/app/viewmodel/TestViewModel.kt`
+
+## Bug 44 🔴 — Test Lab publishes client HLS URL before playlist is confirmed ready → ExoPlayer NPE loop / black client pane
+
+**Symptom:** In Test Lab runs (e.g., 2026-05-03 13:04 UTC), the client player starts loading `http://127.0.0.1:9191/hls/playlist.m3u8` as soon as segment #2 arrives, then throws repeated:
+`PlaybackException: ERROR_CODE_IO_UNSPECIFIED — cause: Unexpected NullPointerException`, enters `STATE_IDLE`, and loops re-prepare without ever rendering video.
+
+**Root cause:** `TestViewModel` made client startup depend only on segment count (`capturedCount == 2`) and not on playlist publication readiness. Under jitter/latency, segment insertion can beat playlist propagation, causing early playlist fetches into unstable content and parser NPE failure.
+
+**Fix:** Gate client startup in Test Lab on **both** conditions:
+1. at least 2 segments produced, and
+2. `onPlaylistReady` has fired and updated relay playlist.
+
+Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishedClientHlsUri` guards.
+
+## Bug 45 🔴 — Malformed relay URL in Settings (`33https://...`) causes silent stream pipeline failures
+
+**Symptom:** Host/client show repeated relay failures and black-screen behavior with logs such as:
+- `Invalid relay URL '33https://...'`
+- `sendSync dropped (not connected)`
+- `Segment upload failed ... Expected URL scheme 'http' or 'https'`
+
+Even after picking a local video, host still segments locally and tries uploads, producing cascading errors.
+
+**Root cause:** Relay URL settings may contain accidental leading garbage (e.g., `33https://...`).
+`RelayClient` correctly rejects it, but stream start still proceeds far enough to trigger repeated failed uploads and confusing downstream behavior.
+
+**Fix:** In `SyncViewModel`:
+1. Normalize user-entered relay URL by trimming and stripping any prefix before the first `http://` or `https://`.
+2. Validate with `toHttpUrlOrNull()` and require scheme `http`/`https`.
+3. If invalid, set connection status to "Invalid relay URL — open Settings", skip relay initialization, and block `setVideoFile` stream startup.
