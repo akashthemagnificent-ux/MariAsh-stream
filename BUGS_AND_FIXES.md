@@ -893,3 +893,20 @@ errors and completion events appear in the in-app Logs screen.
 2. `onPlaylistReady` has fired and updated relay playlist.
 
 Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishedClientHlsUri` guards.
+
+---
+
+## Bug 45 🔴 — RelayClient.kt: Upload failures log "null" instead of exception details
+**File:** `app/src/main/java/com/agon/app/relay/RelayClient.kt`, `app/src/main/java/com/agon/app/viewmodel/SyncViewModel.kt`
+**Symptom:** When segment uploads fail due to low-level network issues (e.g., `SocketTimeoutException`), the logs show `Segment upload failed: seg_00000.mp4 — null`. This makes it impossible to diagnose why the host is failing to feed the relay.
+**Root cause:** `e.message` is null for many standard Java/Android networking exceptions.
+**Fix:** Updated `RelayClient` and `SyncViewModel` to use `e.message ?: e.javaClass.simpleName`. Now logs will show `SocketTimeoutException` or `ConnectException` instead of `null`.
+
+---
+
+## Bug 46 🟠 — HlsSegmenter.kt: Client occasionally starts at live edge despite EVENT type
+**File:** `app/src/main/java/com/agon/app/segmenter/HlsSegmenter.kt`
+**Symptom:** Even with `#EXT-X-PLAYLIST-TYPE:EVENT`, some versions of ExoPlayer or specific network conditions might cause the client to jump to the latest segment, leading to a black screen if the buffer isn't deep enough.
+**Root cause:** While `EVENT` suggests starting from the beginning, `#EXT-X-START:TIME=0` is the explicit way to force it.
+**Fix:** Added `#EXT-X-START:TIME=0` to the HLS playlist header. This ensures the client always begins playback from the first segment.
+

@@ -235,6 +235,8 @@ class HlsSegmenter(
             // Without this ExoPlayer treats the playlist as a live stream and
             // jumps to the last segment, causing black screen + stall.
             appendLine("#EXT-X-PLAYLIST-TYPE:EVENT")
+            // Force ExoPlayer to start at the beginning of the event
+            appendLine("#EXT-X-START:TIME=0")
             appendLine("#EXT-X-TARGETDURATION:$targetDuration")
             appendLine("#EXT-X-MEDIA-SEQUENCE:0")
             files.forEachIndexed { i, file ->

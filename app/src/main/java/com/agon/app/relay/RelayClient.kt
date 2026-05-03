@@ -196,7 +196,8 @@ class RelayClient(
                 lastErr = e
                 if (attempt == 3) return@repeat
                 val retryDelay = (attempt + 1) * 800L
-                AppLogger.w(TAG, "Upload retry ${attempt + 1} for $filename in ${retryDelay}ms: ${e.message}")
+                val errDetail = e.message ?: e.javaClass.simpleName
+                AppLogger.w(TAG, "Upload retry ${attempt + 1} for $filename in ${retryDelay}ms: $errDetail")
                 delay(retryDelay)
             }
         }

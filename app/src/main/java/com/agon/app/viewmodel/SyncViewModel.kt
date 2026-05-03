@@ -323,7 +323,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         AppLogger.d(TAG, "Segment $name uploaded (total=${_segmentsUploaded.value})")
                         maybeSendStreamReady()
                     } catch (e: Exception) {
-                        AppLogger.e(TAG, "Segment upload failed: $name — ${e.message}")
+                        val errDetail = e.message ?: e.javaClass.simpleName
+                        AppLogger.e(TAG, "Segment upload failed: $name — $errDetail")
                     }
                 }
             },
@@ -335,7 +336,10 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         playlistUploadedForEpoch = _streamEpoch.value
                         maybeSendStreamReady()
                     }
-                    catch (e: Exception) { AppLogger.e(TAG, "Playlist upload failed: ${e.message}") }
+                    catch (e: Exception) { 
+                        val errDetail = e.message ?: e.javaClass.simpleName
+                        AppLogger.e(TAG, "Playlist upload failed: $errDetail") 
+                    }
                 }
             },
             onProgress = {},
