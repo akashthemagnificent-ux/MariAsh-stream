@@ -146,6 +146,14 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                 override fun onDisconnected(reason: String) {
                     viewModelScope.launch {
                         _isConnected.value = false
+                        // Bug 38 fix: RelayClient now fires onDisconnected("NO_RELAY_URL")
+                        // instead of throwing IllegalArgumentException when the relay URL
+                        // is blank. Treat this as a permanent config error — do NOT count
+                        // it as a network disconnect or trigger the "waking server" screen.
+                        if (reason == "NO_RELAY_URL") {
+                            _connectionStatus.value = "No relay server set — go to Settings"
+                            return@launch
+                        }
                         val isAuthError = reason.contains("401") || reason.contains("403") ||
                             reason.contains("Unauthorized", ignoreCase = true)
                         _connectionStatus.value = if (isAuthError) "Authentication failed" else "Reconnecting…"

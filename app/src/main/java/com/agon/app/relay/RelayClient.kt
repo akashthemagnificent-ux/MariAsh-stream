@@ -62,19 +62,43 @@ class RelayClient(
 
     fun connect() {
         if (destroyed) return
+
+        // Bug 38 fix: if the relay URL is blank the OkHttp Request.Builder will
+        // throw IllegalArgumentException ("Expected URL scheme 'http' or 'https'
+        // but no colon was found") because the constructed WebSocket URL becomes
+        // "/sync/ROOM?role=client" — a relative URL with no scheme or host.
+        // That exception propagates uncaught through initRoom() → LaunchedEffect
+        // → crashes the app. Guard here and fire onDisconnected with a clear
+        // message so RoomScreen can show "configure relay" instead of crashing.
+        if (relayBaseUrl.isBlank()) {
+            listener.onDisconnected("NO_RELAY_URL")
+            return
+        }
+
         val wsUrl = relayBaseUrl
             .replace("https://", "wss://")
             .replace("http://", "ws://")
             .trimEnd('/')
         val role = if (isHost) "host" else "client"
-        val encodedToken = if (relayToken.isNotBlank()) URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString()) else ""
+        val encodedToken = if (relayToken.isNotBlank())
+            URLEncoder.encode(relayToken, StandardCharsets.UTF_8.toString()) else ""
         val tokenQuery = if (encodedToken.isNotBlank()) "&token=$encodedToken" else ""
-        val request = Request.Builder()
-            .url("$wsUrl/sync/$roomId?role=$role$tokenQuery")
-            .apply {
-                if (relayToken.isNotBlank()) header("X-Relay-Token", relayToken)
-            }
-            .build()
+
+        // Bug 38 fix (secondary): wrap Request.Builder in try-catch so a
+        // malformed URL (e.g. user typed "myserver" with no scheme) produces a
+        // user-visible error instead of a crash.
+        val request = try {
+            Request.Builder()
+                .url("$wsUrl/sync/$roomId?role=$role$tokenQuery")
+                .apply {
+                    if (relayToken.isNotBlank()) header("X-Relay-Token", relayToken)
+                }
+                .build()
+        } catch (e: IllegalArgumentException) {
+            Log.e("RelayClient", "Invalid relay URL '$relayBaseUrl': ${e.message}")
+            listener.onDisconnected("Invalid relay URL — check Settings. (${e.message})")
+            return
+        }
 
         webSocket = wsClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {

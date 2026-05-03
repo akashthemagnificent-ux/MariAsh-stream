@@ -80,7 +80,7 @@ fun HomeScreen(navController: NavController) {
                                 fontWeight = FontWeight.SemiBold,
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer)
-                            Text("Go to Settings to add your free Render server. Without one, only web URLs will work.",
+                            Text("Go to Settings to add your free Render server. Hosting local files and joining rooms both require a relay server.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer)
                         }
@@ -132,9 +132,35 @@ fun HomeScreen(navController: NavController) {
                         Text("Host a Web Video", fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleSmall)
                     }
-                    Text("Paste a direct MP4 or HLS (.m3u8) link. No relay needed for this mode.",
+                    // Bug 38/39 fix: make it explicit that TikTok/YouTube/Instagram
+                    // share links do NOT work. Only direct .mp4 or .m3u8 URLs work.
+                    // Social media sites serve video through JavaScript players with
+                    // authentication tokens — ExoPlayer cannot play them.
+                    Text("Paste a direct MP4 or HLS (.m3u8) link. No relay needed.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Icon(Icons.Default.Warning, contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(16.dp).padding(top = 2.dp))
+                            Text(
+                                "TikTok, YouTube, Instagram, and Netflix links do NOT work here. " +
+                                "They use login-protected CDNs that ExoPlayer cannot access. " +
+                                "Use a direct .mp4 or .m3u8 URL only.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                    }
                     OutlinedTextField(
                         value = webUrl,
                         onValueChange = { webUrl = it },
@@ -184,14 +210,22 @@ fun HomeScreen(navController: NavController) {
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
+                    // Bug 38 fix: joining also requires the relay URL.
+                    // Without it RelayClient.connect() throws IllegalArgumentException
+                    // (no scheme on the WebSocket URL) which crashes the app.
                     Button(
                         onClick = { if (roomId.isNotBlank()) navController.navigate("room/$roomId/false") },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = roomId.isNotBlank()
+                        enabled = roomId.isNotBlank() && relayUrl.isNotBlank()
                     ) {
                         Icon(Icons.Default.Login, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Join Room")
+                    }
+                    if (relayUrl.isBlank()) {
+                        Text("Set a relay server in Settings first — ask your partner for the server URL",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error)
                     }
                 }
             }

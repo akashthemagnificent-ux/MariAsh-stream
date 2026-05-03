@@ -3,13 +3,18 @@ package com.agon.app.ui.components
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BrokenImage
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.C
 import androidx.media3.common.TrackSelectionOverride
@@ -64,6 +70,13 @@ fun VideoPlayer(
     var availableTracks by remember { mutableStateOf<Tracks?>(null) }
     var wasPlayingBeforeBuffer by remember { mutableStateOf(false) }
     var localLatencyMs by remember { mutableStateOf(0L) }
+
+    // Bug 39 fix: ExoPlayer fails silently on unplayable URLs (TikTok share
+    // links, geo-blocked CDN URLs, URLs requiring login cookies, etc.) —
+    // the PlayerView stays black with no indication of what went wrong.
+    // Capture the PlaybackException and show a human-readable overlay so the
+    // user knows the URL is the problem, not the app.
+    var playerError by remember { mutableStateOf<String?>(null) }
 
     // Bug fix (buffering deadlock): client must NOT send "buffering start/stop"
     // until it has received at least one play command from the host.
@@ -188,6 +201,26 @@ fun VideoPlayer(
                             else -> return
                         }
                         onSendSync(gson.toJson(SyncMessage("buffering", action, exoPlayer.currentPosition)))
+                    }
+                }
+
+                // Bug 39 fix: capture playback errors so we can show an overlay
+                // instead of leaving the user staring at a silent black screen.
+                // Common causes: TikTok/YouTube/Netflix CDN returns 403, geo-block,
+                // URL requires login cookies, or the URL is a webpage not a video.
+                override fun onPlayerError(error: PlaybackException) {
+                    val cause = error.cause?.message ?: error.message ?: "Unknown error"
+                    playerError = when {
+                        cause.contains("403") || cause.contains("Forbidden", ignoreCase = true) ->
+                            "Video URL blocked (HTTP 403). TikTok/YouTube/Netflix links don't work — use a direct .mp4 or .m3u8 URL."
+                        cause.contains("404") || cause.contains("Not Found", ignoreCase = true) ->
+                            "Video not found (HTTP 404). The URL may have expired or the file was moved."
+                        cause.contains("UnrecognizedInputFormatException") || cause.contains("format", ignoreCase = true) ->
+                            "Unsupported video format. Make sure the URL points to a .mp4 or .m3u8 file, not a webpage."
+                        cause.contains("Unable to connect") || cause.contains("ECONNREFUSED") ||
+                            cause.contains("timeout", ignoreCase = true) ->
+                            "Could not reach the video server. Check your internet connection."
+                        else -> "Playback error: $cause"
                     }
                 }
 
@@ -338,6 +371,31 @@ fun VideoPlayer(
                 },
                 modifier = Modifier.fillMaxSize()
             )
+
+            // Bug 39 fix: show a human-readable error instead of silent black screen
+            if (playerError != null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.85f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(24.dp)) {
+                        Icon(Icons.Default.BrokenImage, contentDescription = null,
+                            tint = Color.Red.copy(alpha = 0.8f),
+                            modifier = Modifier.padding(bottom = 12.dp))
+                        Text("Video failed to load",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(8.dp))
+                        Text(playerError ?: "",
+                            color = Color.White.copy(alpha = 0.75f),
+                            style = MaterialTheme.typography.bodySmall,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    }
+                }
+            }
 
             IconButton(
                 onClick = { showTrackSelector = true },

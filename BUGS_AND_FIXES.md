@@ -660,3 +660,103 @@ use a plain `ByteArrayInputStream` to avoid unnecessary overhead.
 latency. Under India → USA (260 ms one-way, 10 Mbps), the client starts playing
 ~2–3 s after the first pong aligns it with the host, matching what users of the
 live Render relay actually experience.
+
+---
+
+## Bug 38 — App crash when client joins without relay server configured
+
+**Symptom:** A fresh install (Samsung or any device) where the user hasn't gone
+to Settings to enter the relay URL will crash instantly when tapping "Join Room".
+Samsung shows "MariAsh Stream closed because this app has a bug — try clearing
+cache". Clearing cache doesn't help because the problem is a code crash, not
+corrupted data.
+
+**Root cause:** `AppPreferences.relayUrl` emits `""` (empty string) as its
+default when no URL has been saved. `RoomScreen` collects it with
+`initial = null` so the `LaunchedEffect` guard (`if (relayUrl == null) return`)
+correctly waits for the first DataStore emission. But that first emission IS `""`
+— non-null — so `initRoom("", ...)` fires immediately. Inside
+`RelayClient.connect()`, the WebSocket URL is built as:
+
+```
+"$wsUrl/sync/$roomId?role=client"
+→ "/sync/AC8713?role=client"   // wsUrl="" after replace/trimEnd
+```
+
+`okhttp3.Request.Builder().url("/sync/AC8713?role=client")` throws
+`IllegalArgumentException: Expected URL scheme 'http' or 'https' but no colon
+was found` — synchronously, before any network call. This exception propagates
+uncaught through `initRoom()` → the `LaunchedEffect` coroutine → crashes the app.
+
+**Fix (three layers):**
+
+1. `HomeScreen.kt` — "Join Room" button `enabled` now requires BOTH
+   `roomId.isNotBlank() && relayUrl.isNotBlank()`. An error label "Set a relay
+   server in Settings first" appears when `relayUrl` is blank, preventing the
+   user from even navigating to RoomScreen with no relay set.
+
+2. `RelayClient.connect()` — added an early guard:
+   ```kotlin
+   if (relayBaseUrl.isBlank()) {
+       listener.onDisconnected("NO_RELAY_URL")
+       return
+   }
+   ```
+   Also wrapped `Request.Builder().url(...)` in `try/catch(IllegalArgumentException)`
+   for malformed URLs (e.g. user typed "myserver" with no scheme).
+
+3. `SyncViewModel.onDisconnected()` — added sentinel handling:
+   ```kotlin
+   if (reason == "NO_RELAY_URL") {
+       _connectionStatus.value = "No relay server set — go to Settings"
+       return@launch
+   }
+   ```
+   This prevents a blank-URL disconnect from incrementing `disconnectCount` and
+   falsely triggering the "Waking server…" screen.
+
+---
+
+## Bug 39 — Silent black screen when ExoPlayer fails to load a video URL
+
+**Symptom:** Client (or host in web-URL mode) shows a permanently black screen
+with no error message. Affects any URL that ExoPlayer cannot play: TikTok/YouTube/
+Netflix share links, geo-blocked CDN URLs, expired signed URLs, or webpages
+mistaken for direct video files.
+
+**Root cause:** `VideoPlayer` had no `onPlayerError` override in its
+`Player.Listener`. When ExoPlayer hits an HTTP 403, 404, or format error, it
+transitions to `Player.STATE_IDLE` with an error, but the `PlayerView` just
+stays black. The user has no way of knowing whether the video is loading,
+buffering, or has failed.
+
+**Fix:** Added `onPlayerError(PlaybackException)` override to the Player.Listener
+in `VideoPlayer.kt`. It maps the raw exception to a human-readable string:
+- HTTP 403 / Forbidden → explains TikTok/YouTube CDN restriction
+- HTTP 404 / Not Found → URL expired or file moved
+- UnrecognizedInputFormatException → URL is a webpage, not a video file
+- Connection refused / timeout → network issue
+
+A `playerError` state variable holds the message. When non-null, a dark overlay
+with a broken-image icon and the error text is drawn on top of the black
+`PlayerView`, so the user immediately knows what went wrong and what to do.
+
+---
+
+## Bug 40 — GitHub Actions builds will break on June 2nd 2026 (Node.js 20 deprecation)
+
+**Symptom:** Build warnings on every CI run:
+> Node.js 20 actions are deprecated. actions/checkout@v4, actions/setup-java@v4,
+> actions/upload-artifact@v4, softprops/action-gh-release@v2 will be forced to
+> Node.js 24 by default starting June 2nd, 2026.
+
+**Root cause:** The runner images run action JavaScript with Node.js 20. GitHub
+is removing Node.js 20 support on June 2nd 2026 (29 days from discovery). After
+that date, actions that haven't been opted into Node 24 will fail unpredictably.
+
+**Fix:** Added `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"` to the job-level
+`env` block in `.github/workflows/build-apk.yml`. This immediately opts all four
+actions into Node.js 24, eliminating the warning and future-proofing the build
+before the deadline. After June 2nd when Node 24 becomes the runner default, the
+env var can be removed (it will be a no-op by then).
+
