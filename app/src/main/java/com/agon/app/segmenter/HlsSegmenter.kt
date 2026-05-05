@@ -133,12 +133,12 @@ class HlsSegmenter(
                     completedDurations.add(dur)
 
                     // Notify caller — caller is responsible for reading the bytes.
-                    // Bug fix: delete the file immediately after the caller has read
-                    // it so segments don't accumulate on disk (each 4-second segment
-                    // at typical movie bitrates is 0.5–3 MB; a full movie would
-                    // otherwise fill hundreds of MB of app cache).
+                    // Notify caller — caller is responsible for reading the bytes.
+                    // The caller (SyncViewModel) reads the file into memory for upload.
+                    // We do NOT delete it here because the upload is asynchronous;
+                    // instead, we rely on outputDir.deleteRecursively() at the start
+                    // of the next session to clean up the cache.
                     onSegmentReady(file.name, file)
-                    file.delete()
 
                     onProgress(completedFiles.size)
                     onPlaylistReady(buildPlaylist(completedFiles, completedDurations, isComplete = false))

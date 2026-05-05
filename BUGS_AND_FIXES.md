@@ -910,3 +910,12 @@ Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishe
 **Root cause:** While `EVENT` suggests starting from the beginning, `#EXT-X-START:TIME=0` is the explicit way to force it.
 **Fix:** Added `#EXT-X-START:TIME=0` to the HLS playlist header. This ensures the client always begins playback from the first segment.
 
+---
+
+## Bug 47 🔴 — HlsSegmenter.kt: Race condition deletes segment before upload
+**File:** `app/src/main/java/com/agon/app/segmenter/HlsSegmenter.kt`
+**Symptom:** Host logs show `Segment upload failed: seg_00000.mp4 — null` or `FileNotFoundException`. The client sees a black screen because no segments ever reach the relay.
+**Root cause:** The segmenter was calling `file.delete()` immediately after `onSegmentReady(file.name, file)`. Since `onSegmentReady` triggers an asynchronous upload in `SyncViewModel`, the file was often deleted before the upload thread could open it to read the bytes.
+**Fix:** Removed the immediate `file.delete()` call. Segments are now kept in the app's cache directory for the duration of the session and cleaned up when a new segmentation session starts via `outputDir.deleteRecursively()`.
+
+
