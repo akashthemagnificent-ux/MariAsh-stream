@@ -926,5 +926,30 @@ Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishe
 **Root cause:** `setVideoFile()` sends a `stream_reset` message immediately. If the WebSocket connection to the relay is still in the "Connecting" state (common when first entering a room), `sendMessage()` drops the message. Unlike the web video path (`setWebUrl`), the local file path had no "pending" mechanism to re-send the reset once the connection was established.
 **Fix:** Added `pendingLocalEpoch` to `SyncViewModel`. When `onConnected()` fires, it now checks if a local video was selected while offline and re-sends the `stream_reset` message. Also ensured `pendingWebUrl` is cleared when a local file is picked to avoid conflicting states.
 
+---
+
+## Bug 49 🟠 — SyncViewModel.kt: Short videos never trigger stream_ready
+**File:** `app/src/main/java/com/agon/app/viewmodel/SyncViewModel.kt`
+**Symptom:** Host selects a very short video (e.g., 5 seconds). The client stays on "Waiting for host" forever.
+**Root cause:** `maybeSendStreamReady()` was hard-coded to wait for `_segmentsUploaded.value >= 2`. A 5-second video only produces 1 segment.
+**Fix:** Added `isSegmentingComplete` flag. `maybeSendStreamReady()` now allows the stream to start if at least 1 segment is uploaded AND the segmenter has finished its work.
+
+---
+
+## Bug 50 🔴 — RoomScreen.kt: Phone sleeps during playback, cutting connection
+**File:** `app/src/main/java/com/agon/app/ui/screens/RoomScreen.kt`
+**Symptom:** During a long movie, the screen turns off and the connection drops.
+**Root cause:** No wake lock was implemented to prevent the OS from sleeping the screen/CPU during playback.
+**Fix:** Added a `DisposableEffect` that applies `FLAG_KEEP_SCREEN_ON` to the activity window whenever a video is active in the `RoomScreen`.
+
+---
+
+## Bug 51 🟠 — VideoPlayer.kt: Sync message flooding
+**File:** `app/src/main/java/com/agon/app/ui/components/VideoPlayer.kt`
+**Symptom:** Unstable connection or "Rate limit exceeded" on the relay.
+**Root cause:** Rapid state changes (e.g., scrubbing or rapid play/pause) could send dozens of WebSocket messages per second.
+**Fix:** Implemented `throttledSendSync()` to ensure at least 500ms between non-critical sync messages, while still allowing critical state changes (like initial play/pause) to fire immediately.
+
+
 
 

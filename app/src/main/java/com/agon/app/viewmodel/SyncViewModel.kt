@@ -107,10 +107,19 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private var hasSentStreamReady: Boolean = false
     private var playlistUploadedForEpoch: Long = 0L
 
+    private var isSegmentingComplete = false
+
     private fun maybeSendStreamReady() {
-        if (_isHost.value && !hasSentStreamReady && playlistUploadedForEpoch == _streamEpoch.value && _segmentsUploaded.value >= 2) {
+        if (!_isHost.value || hasSentStreamReady) return
+        if (playlistUploadedForEpoch != _streamEpoch.value) return
+
+        // Bug 49 fix: allow stream_ready if we have 2 segments OR if the video
+        // is so short that segmenting is already complete with only 1 segment.
+        val ready = _segmentsUploaded.value >= 2 || (isSegmentingComplete && _segmentsUploaded.value >= 1)
+        
+        if (ready) {
             hasSentStreamReady = true
-            AppLogger.i(TAG, "2 segments + playlist uploaded — sending stream_ready (epoch=${_streamEpoch.value})")
+            AppLogger.i(TAG, "Stream ready (segs=${_segmentsUploaded.value}, complete=$isSegmentingComplete) — sending stream_ready")
             sendMessage(gson.toJson(SyncMessage(type = "stream_ready", streamEpoch = _streamEpoch.value)))
         }
     }
@@ -312,6 +321,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     private fun startSegmenting(uri: Uri) {
         hlsSegmenter?.stop()
         _isSegmenting.value = true
+        isSegmentingComplete = false
         _segmentsUploaded.value = 0
         playlistUploadedForEpoch = 0L
         val outputDir = File(context.cacheDir, "hls_${_roomId.value}").also {
@@ -355,7 +365,11 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             onError = { AppLogger.e(TAG, "Segmenter error: $it"); viewModelScope.launch { _isSegmenting.value = false } },
             onComplete = {
                 AppLogger.i(TAG, "Segmenting complete — ${_segmentsUploaded.value} segments total")
-                viewModelScope.launch { _isSegmenting.value = false }
+                viewModelScope.launch { 
+                    isSegmentingComplete = true
+                    _isSegmenting.value = false 
+                    maybeSendStreamReady()
+                }
             }
         )
 

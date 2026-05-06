@@ -63,6 +63,20 @@ fun RoomScreen(
     val activity = context as? ComponentActivity
     val activeReactions = remember { mutableStateListOf<FloatingReaction>() }
 
+    // Bug 50 fix: keep screen on during playback
+    val wakeLockEnabled by AppPreferences.wakeLock(context).collectAsState(initial = true)
+
+    DisposableEffect(activity, wakeLockEnabled, videoUri, proxyUrl) {
+        if (wakeLockEnabled && (videoUri != null || proxyUrl != null)) {
+            activity?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            AppLogger.d("RoomScreen", "WakeLock acquired (screen on)")
+        }
+        onDispose {
+            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            AppLogger.d("RoomScreen", "WakeLock released")
+        }
+    }
+
     DisposableEffect(activity) {
         val observer = Consumer<PictureInPictureModeChangedInfo> { info ->
             isPipMode = info.isInPictureInPictureMode

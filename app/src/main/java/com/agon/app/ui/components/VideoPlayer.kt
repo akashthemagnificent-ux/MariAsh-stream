@@ -140,6 +140,16 @@ fun VideoPlayer(
                 .build()
         }
 
+        // Bug 51 fix: throttle sync messages to avoid overwhelming the relay
+        var lastSyncTime by remember { mutableStateOf(0L) }
+        fun throttledSendSync(json: String, force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            if (force || now - lastSyncTime > 500) {
+                onSendSync(json)
+                lastSyncTime = now
+            }
+        }
+
         LaunchedEffect(uri) {
             AppLogger.i(TAG, "Loading URI: $uri isHost=$isHost")
             exoPlayer.setMediaItem(MediaItem.fromUri(uri))
@@ -182,7 +192,7 @@ fun VideoPlayer(
                     if (!isHandlingSync && isHost && !partnerIsBuffering) {
                         val msg = SyncMessage("state", if (isPlaying) "play" else "pause",
                             exoPlayer.currentPosition)
-                        onSendSync(gson.toJson(msg))
+                        throttledSendSync(gson.toJson(msg), force = true)
                     }
                 }
 
@@ -192,7 +202,7 @@ fun VideoPlayer(
                     if (!isHandlingSync && isHost && reason == Player.DISCONTINUITY_REASON_SEEK) {
                         AppLogger.d(TAG, "Host seek: ${oldPos.positionMs}→${newPos.positionMs}ms")
                         val msg = SyncMessage("sync", "seek", exoPlayer.currentPosition)
-                        onSendSync(gson.toJson(msg))
+                        throttledSendSync(gson.toJson(msg), force = true)
                     }
                 }
 
@@ -217,7 +227,7 @@ fun VideoPlayer(
                             else -> return
                         }
                         AppLogger.i(TAG, "Client buffering $action — notifying host")
-                        onSendSync(gson.toJson(SyncMessage("buffering", action, exoPlayer.currentPosition)))
+                        throttledSendSync(gson.toJson(SyncMessage("buffering", action, exoPlayer.currentPosition)), force = true)
                     }
                 }
 
