@@ -918,4 +918,13 @@ Implemented via `maybePublishClientHlsUri()` with `playlistReady` + `hasPublishe
 **Root cause:** The segmenter was calling `file.delete()` immediately after `onSegmentReady(file.name, file)`. Since `onSegmentReady` triggers an asynchronous upload in `SyncViewModel`, the file was often deleted before the upload thread could open it to read the bytes.
 **Fix:** Removed the immediate `file.delete()` call. Segments are now kept in the app's cache directory for the duration of the session and cleaned up when a new segmentation session starts via `outputDir.deleteRecursively()`.
 
+---
+
+## Bug 48 🔴 — SyncViewModel.kt: Local video selection fails to sync if relay is not yet connected
+**File:** `app/src/main/java/com/agon/app/viewmodel/SyncViewModel.kt`
+**Symptom:** Host selects a local movie file, but the client remains stuck on "Waiting for host to select a video".
+**Root cause:** `setVideoFile()` sends a `stream_reset` message immediately. If the WebSocket connection to the relay is still in the "Connecting" state (common when first entering a room), `sendMessage()` drops the message. Unlike the web video path (`setWebUrl`), the local file path had no "pending" mechanism to re-send the reset once the connection was established.
+**Fix:** Added `pendingLocalEpoch` to `SyncViewModel`. When `onConnected()` fires, it now checks if a local video was selected while offline and re-sends the `stream_reset` message. Also ensured `pendingWebUrl` is cleared when a local file is picked to avoid conflicting states.
+
+
 

@@ -103,6 +103,7 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
     // sendSync drops messages silently when connected=false).
     private var pendingWebUrl: String? = null
     private var pendingWebEpoch: Long = 0L
+    private var pendingLocalEpoch: Long = 0L
     private var hasSentStreamReady: Boolean = false
     private var playlistUploadedForEpoch: Long = 0L
 
@@ -161,14 +162,20 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
                         // Bug 30 fix: re-send web URL if setWebUrl() was called before
                         // the relay connection was established. Without this, the client
                         // would see "Waiting for host to select a video" indefinitely.
-                        val webUrl = pendingWebUrl
-                        if (isHost && webUrl != null) {
+                        if (isHost) {
                             delay(300) // brief settle time for the connection
-                            sendMessage(gson.toJson(SyncMessage(
-                                type = "stream_reset", streamEpoch = pendingWebEpoch)))
-                            sendMessage(gson.toJson(SyncMessage(
-                                type = "web_url", url = webUrl, streamEpoch = pendingWebEpoch)))
-                            AppLogger.d(TAG, "Re-sent web_url after connect: $webUrl")
+                            val webUrl = pendingWebUrl
+                            if (webUrl != null) {
+                                sendMessage(gson.toJson(SyncMessage(
+                                    type = "stream_reset", streamEpoch = pendingWebEpoch)))
+                                sendMessage(gson.toJson(SyncMessage(
+                                    type = "web_url", url = webUrl, streamEpoch = pendingWebEpoch)))
+                                AppLogger.d(TAG, "Re-sent web_url after connect: $webUrl")
+                            } else if (pendingLocalEpoch > 0) {
+                                sendMessage(gson.toJson(SyncMessage(
+                                    type = "stream_reset", streamEpoch = pendingLocalEpoch)))
+                                AppLogger.d(TAG, "Re-sent stream_reset for local file after connect")
+                            }
                         }
                     }
                 }
@@ -279,6 +286,8 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
             val epoch = System.currentTimeMillis()
             _streamEpoch.value = epoch
             hasSentStreamReady = false
+            pendingLocalEpoch = epoch
+            pendingWebUrl = null // clear web URL if local file is picked
             sendMessage(gson.toJson(SyncMessage(type = "stream_reset", streamEpoch = epoch)))
             startSegmenting(uri)
         }
