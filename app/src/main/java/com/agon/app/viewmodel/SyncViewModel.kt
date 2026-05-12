@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.File
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -139,7 +140,17 @@ class SyncViewModel(application: Application) : AndroidViewModel(application) {
         _hostLeft.value = null
         this.relayToken = relayToken.trim()
 
-        val baseUrl = relayUrl.trimEnd('/')
+        val normalizedUrl = normalizeRelayUrl(relayUrl)
+        val parsed = normalizedUrl.toHttpUrlOrNull()
+        if (parsed == null || (parsed.scheme != "http" && parsed.scheme != "https")) {
+            _connectionStatus.value = "Invalid relay URL — open Settings"
+            _isConnected.value = false
+            AppLogger.e(TAG, "Invalid relay URL in settings: '$relayUrl' (normalized='$normalizedUrl')")
+            relayClient = null
+            return
+        }
+
+        val baseUrl = parsed.toString().trimEnd('/')
 
         relayClient = RelayClient(
             relayBaseUrl = baseUrl,
